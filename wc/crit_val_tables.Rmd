@@ -1,0 +1,78 @@
+---
+output: github_document
+---
+# Critical Value Table Computations
+
+This file details how to generate critical value tables for our Wilcoxon Signed-Rank test.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(rmutil)
+library(tidyverse)
+library(xtable)
+```
+
+`gen_null` generates a null distribution of test statistics at a given difference set size `n` and privacy parameter `epsilon`. (Note that we don't load the version of `gen_null` in the `fxns` folder, as we don't need to consider epsilon values of NA.)
+
+```{r gen_null}
+gen_null <- function(n, epsilon, reps) {
+  s <- sqrt(n*(n+1)*(2*n+1)/6)
+  noise <- rlaplace(n = reps,
+                    m = 0,
+                    s = 2*n/(epsilon))
+  Z <- rnorm(n = reps,
+             mean = 0,
+             sd = s)
+  noise + Z
+}
+```
+
+```{r new_crit_vals}
+ sizes <- c(10, 20, 30, 40, 50, 75, 100, 200, 300, 400, 500, 1000)
+ epsilons <- c(1, .1, .01)
+ l_s <- length(sizes)
+ l_e <- length(epsilons)
+  
+crit_vals <- map2(rep(sizes, times = l_e),
+                  rep(epsilons, each = l_s),
+                  gen_null,
+                  reps = 1e7) %>%
+# take the absolute value of the null distributions in order to 
+# compute two-sided critical values
+               map(.,
+                   .f = abs) %>%
+# find the critical value of each distribution at several common alphas
+               map(., 
+                   .f = quantile, 
+                   probs = 1 - c(.05, .025, .01, .005))
+  
+# we now have the critical values, and put them together into a table
+ crit_val_table_master <- rbind_list(crit_vals) %>%
+   cbind(rep(sizes, 3), .)
+ names(crit_val_table_master) <- c("N", .05, .025, .01, .005)
+ crit_val_table_master <- round(crit_val_table_master, digits = 0)
+ 
+# break up the tables by unique epsilon
+ crit_val_eps_1.0 <- slice(crit_val_table_master, 1:l_s) %>% xtable(digits = 0)
+ crit_val_eps_0.1 <- slice(crit_val_table_master, (l_s + 1):(2*l_s)) %>% xtable(digits = 0)
+ crit_val_eps_.01 <- slice(crit_val_table_master, (2*l_s + 1):(3*l_s)) %>% xtable(digits = 0)
+
+crit_val_eps_1.0 %>% kable()
+crit_val_eps_0.1 %>% kable()
+crit_val_eps_.01 %>% kable()
+ 
+# save all of the resulting tables
+ print.xtable(crit_val_eps_1.0, 
+              file = "figures/wc_crit_val_eps_1point0.tex",
+              include.rownames = FALSE)
+ print.xtable(crit_val_eps_0.1, 
+              file = "figures/wc_crit_val_eps_0point1.tex",
+              include.rownames = FALSE)
+ print.xtable(crit_val_eps_.01, 
+              file = "figures/wc_crit_val_eps_point01.tex",
+              include.rownames = FALSE)
+```

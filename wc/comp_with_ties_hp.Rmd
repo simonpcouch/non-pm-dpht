@@ -1,0 +1,305 @@
+---
+output: github_document
+---
+# Comparative Power Analysis
+#### *Robustness to Ties—High Privacy*
+
+This file analyzes the power of our DP Wilcoxon Signed-Rank test in comparison to Task 2016's High Privacy test in the setting where sample data comes from a discrete distribution.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE)
+```
+
+This document addresses the relative robustness to ties of both our and Task 2016's differentially private version of the Wilcoxon Signed-Rank test.
+
+```{r packages}
+library(rmutil)
+library(tidyverse)
+```
+
+We define a set of functions to functionalize the power analysis process, eventually coming together in a `pwr_plot` function that simulates data, calculates test statistics, finds power, and plots an informative graph based on user arguments.
+
+Some functions used throughout this repo are universal to most of the files. We load them now. Refer to the relevant files in the `fxns` folder for documentation.
+
+```{r fxns}
+source('wc/fxns/wc.R')
+source('wc/fxns/wc_new.R')
+source('wc/fxns/gen_null.R')
+source('wc/fxns/calc_task_crit_val.R')
+```
+
+`gen_data` is a function that generates difference sets and noise with given parameters. The arguments of `gen_data` are as follows:
+
+* `n`: a numeric of desired difference set size
+* `prop_0`: a numeric of the proportion of the difference set to round to 0
+* `mean`: a vector (length 2) of means to draw random samples with--supplying identical means and standard deviations generates a null distribution of test statistics
+* `sd`: a vector (length 2) of standard deviations to draw random samples with--supplying identical means and standard devations generates a null distribution of test statistics
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+* `epsilon`: NA or a numeric--the epsilon to carry the test out with--NA indicates a public test
+
+The function outputs a dataframe of distributions of difference sets.
+
+```{r gen_data}
+gen_data <- function(n, prop_0, mean, sd, reps, epsilon = NA, k) {
+  if (is.na(epsilon)) { # carry out the public version
+    vals <- data_frame(x1 = rnorm(n = reps*round(n*(1-prop_0)), 
+                       mean = mean[1],
+                       sd = sd[1]),
+               x2 = rnorm(n = reps*round(n*(1-prop_0)), 
+                       mean = mean[2],
+                       sd = sd[2]),
+               x = (x1 - x2),
+               replicate = as.factor(rep(1:reps, 
+                                         each = round(n*(1-prop_0))))) %>%
+          select(x, replicate)
+    zeroes <- data_frame(x = rep(0, reps*round(n*prop_0)),
+                         replicate = rep(1:reps, each = round(n*(prop_0))))           
+    rbind(vals, zeroes)
+  } else { # carry out the private version
+     vals <- data_frame(x1 = rnorm(n = reps*round((1-prop_0)*n), 
+                                   mean = mean[1],
+                                   sd = sd[1]),
+                        x2 = rnorm(n = reps*round(n*(1-prop_0)), 
+                                  mean = mean[2],
+                                  sd = sd[2]),
+                        x = x1 - x2,
+                        replicate = rep(1:reps, each = round(n*(1-prop_0))),
+                        noise = rep(rlaplace(n = reps,
+                                             m = 0,
+                                             s = n*2/epsilon), 
+                                    each = round(n*(1-prop_0))),
+                        noise_task = rep(rlaplace(n = reps,
+                                                  m = 0,
+  # abuse indentation for 80 char limit                                                
+  s = 4*k/(sqrt(2*k*(2*k+1)*(4*k+1)/6)*(epsilon))), 
+                                         each = round(n*(1-prop_0)))) %>%
+          select(x, replicate, noise, noise_task)
+     
+    zeroes <- data_frame(x = rep(0, reps*round(n*prop_0)),
+                         replicate = as.factor(rep(1:reps, each = round(n*(prop_0)))),
+                         noise = rep(Inf, reps*round(n*prop_0)),
+                         noise_task = rep(Inf, reps*round(n*prop_0)))
+    
+    rbind(vals, zeroes)
+  }
+}
+```
+
+Task 2016 details a "priming" procedure to ensure a known, minimum value of `n`. `prime_data` carries out this procedure. The function takes a  dataframe outputted by `gen_data` and outputs a similar dataframe.
+
+```{r prime_data}
+prime_data <- function(df, k) {
+  if ("noise_task" %in% colnames(df)) {
+      reps <- n_distinct(df$replicate)
+      n <- nrow(df)/reps
+      prime <- data_frame(x = rep(c(rep(max(abs(df$x) + 1), k), 
+                                    rep(-max(abs(df$x) - 1), k)), 
+                                  reps),
+                          replicate = rep(1:reps, each = 2*k),
+                          noise = rep(Inf, 2*k*reps),
+                          noise_task = rep(Inf, 2*k*reps))
+      rbind(df, prime)
+  } else {
+      reps <- n_distinct(df$replicate)
+      n <- nrow(df)/reps
+      prime <- data_frame(x = rep(c(rep(max(abs(df$x) + 1), k), 
+                                    rep(-max(abs(df$x) - 1), k)), 
+                                  reps),
+                          replicate = rep(1:reps, each = 2*k),
+                          noise = rep(Inf, 2*k*reps))
+      rbind(df, prime)
+  }
+}
+```
+
+
+`calc_stat` is a function that takes in a dataframe outputted by `gen_data` and outputs a vector of test statistics with length `reps`. The function simply detects whether the supplied dataframe was generated for a private or public test, and then groups the difference sets together and supplies them to `wc`. We supply a second `calc_stat` function, `calc_stat_new`, that calls `wc_new` rather than `wc`.
+
+```{r calc_stat}
+calc_stat <- function(df) {
+    if ("noise_task" %in% colnames(df)) { # carry out the private version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(., stat = ((wc(x) - .5)/sqrt(length(x)*(length(x) + 1)*(2*length(x) + 1)/6) + noise_task[1])) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  } else { # carry out the public version
+  df %>% 
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc(x)) %>%
+    dplyr::select(stat) %>%
+    pull()
+  }
+}
+
+calc_stat_new <- function(df) {
+    if ("noise" %in% colnames(df)) { # carry out the private version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc_new(x) + noise[1]) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  } else { # carry out the public version
+  df %>% 
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc_new(x)) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  }
+}
+```
+
+`pwr_plot` is a wrapper function for each of the functions defined above. The arguments of the function are as follows:
+* `sizes`: a list of numerics--all elements must be in the vector `c(10, 20, 30, 40, 50, 100, 200, 300, 400, 500, 1000)`
+* `prop_0`: a list of numerics--the proportion of ties to introduce into the data
+* arguments beginning with `mean` or `sd` are vectors of length 2--the first two (in position) are the arguments to generate the null distribution, and the second two are to generate the alternate distribution
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+* `epsilon`: NA or a numeric--the epsilon to carry the tests out with--NA indicates a public test
+* `alpha`: a numeric of a significance level used in Task 2016, i.e. one of `c(.0595, .03475, .0199, .01495)`
+* `k`: a numeric for the priming constant used for the TC test's High Privacy variant
+
+```{r pwr_plot}
+pwr_plot <- function(sizes, prop_0, mean_null, sd_null, mean_alt, sd_alt, reps, epsilon, alpha, k) {
+   
+# simulate null distributions at varying sample size and proportion 
+# of zeroes combinations. null_data is a list of dataframes with length 
+# equal to length(prop_0)*length(sizes)
+  
+  null_data <-   map2(.x = rep(sizes, each = length(prop_0)), 
+                      .y = rep(prop_0, length(sizes)), 
+                      .f = gen_data, 
+                      mean = mean_null, 
+                      sd = sd_null, 
+                      reps = reps, 
+                      epsilon = epsilon,
+                      k = k) 
+  
+# simulate test statistics. the output, null_stats, is a dataframe, where each 
+# row is a distinct combination of prop_0 & sample size, with nrow = reps
+
+  null_stats_new <- map_dfc(.x = rep(sizes, each = length(prop_0)), 
+                            .f = gen_null,
+                            epsilon = epsilon,
+                            reps = reps)
+
+# calculate critical values for each combination of proportion of 
+# zeroes and sample size
+  
+  crit_vals_new  <-  map(null_stats_new, 
+                     quantile, 
+                     probs = (1 - alpha), 
+                     na.rm = TRUE) %>% 
+                 unlist(use.names = FALSE)
+  
+# subset the task_crit_val_table to find the critical value for 
+# the given k, and then repeat it for each sample size
+
+  crit_vals_task <- calc_task_crit_val(n = 2*k,
+                                       alpha = alpha,
+                                       epsilon = epsilon) %>%
+                    rep(., length(sizes))
+  
+# simulate alternate distributions at varying sample size and 
+# proportion of zeroes combinations. alt_data is a list of 
+# dataframes with length equal to length(prop_0)*length(sizes)
+  
+  alt_data <-   map2(.x = rep(sizes, each = length(prop_0)), 
+                     .y = rep(prop_0, length(sizes)), 
+                     .f = gen_data, 
+                     mean = mean_alt, 
+                     sd = sd_alt, 
+                     reps = reps, 
+                     epsilon = epsilon,
+                     k = k)
+  
+# "prime" the data for the task procedure  
+  
+  alt_data_primed <- map(.x = alt_data, .f = prime_data, k = k)
+
+# calculate test statistics from the alternate distributions. 
+# the output, alt_stats, is a dataframe, where each row is a 
+# distinct combination of prop_0 & sample size, with nrow = reps
+  
+  alt_stats_task <-  map_dfc(.x = alt_data_primed, 
+                        .f = calc_stat)
+  
+  alt_stats_new <-  map_dfc(.x = alt_data, 
+                            .f = calc_stat_new)
+  
+# these are vectors of powers at given rounding prop_0 and sample 
+# size combinations for both Task's and our test
+   
+  power_vector_task <- map2(.x = rep(crit_vals_task, 
+                                     each = length(prop_0)), 
+                       .y = alt_stats_task, 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+  
+  power_vector_new <- map2(.x = crit_vals_new, 
+                       .y = alt_stats_new, 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+  
+# create a dataframe of arguments and the power_vectors 
+  plot_df <- data_frame(prop_tied = rep(prop_0, 6),
+             sizes = rep(rep(sizes, each = length(prop_0)), 2),
+             power = c(power_vector_task, power_vector_new),
+             type = rep(c("High \nPrivacy", "New"), 
+                        each = length(power_vector_task)))
+  plot_df$power[plot_df$prop_tied == 1] <- 0
+
+  plot_df
+}
+```
+
+#### Generating the Plot
+
+The following function calls generate the plot to be used in the paper.
+
+```{r plot}
+# create a greyscale-friendly, qualitative color scheme
+colors <- c("#000099", "#dd02e0")
+
+# generate the plot data
+wc_vs_task_hp <- pwr_plot(sizes = c(50, 100, 500),
+         prop_0 = seq(from = 0, to = 1, by = .05),
+         mean_null = c(0, 0),
+         sd_null = c(1, 1),
+         mean_alt = c(1, 0),
+         sd_alt = c(1, 1),
+         reps = 1e6,
+         epsilon = 1,
+         alpha = .05,
+         k = 15)
+
+# save the plot data
+save(wc_vs_task_hp, file = "wc/data/wc_vs_task_hp.Rda")
+
+# plot the data
+wc_vs_task_hp_plot <- ggplot(wc_vs_task_hp) +
+    aes(x = prop_tied, 
+        y = power, 
+        linetype = as.factor(sizes), 
+        col = as.factor(type)) + 
+    geom_line(size = 1.3) +
+        labs(x = expression("Proportion of Zeroes in"~d[i]), 
+             y = "Power") +
+        scale_color_manual(name = "Test Type",
+                           values = colors,
+                           labels = c("High Privacy", "New")) +
+        scale_linetype_manual(values = c("solid", "longdash", "dotted"),
+                              name = "Database \nSize n") +
+        theme_minimal(base_family = "Times", base_size = 24) +
+        theme(axis.line = element_line(colour = "black"))
+        
+
+# save the plot
+ggsave(filename = "wc_vs_task_hp.png", 
+       plot = wc_vs_task_hps_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```

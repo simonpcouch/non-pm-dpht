@@ -1,0 +1,172 @@
+---
+output: github_document
+---
+# Critical Value Comparison to Task 2016
+
+This file details how to calculate tables comparing critical values of the public Wilcoxon Signed-Rank test, our DP version, and Task 2016's version.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(rmutil)
+library(tidyverse)
+library(xtable)
+```
+
+We first put together a list of arguments that we will find critical values for for each of the public test, our test, and the public test. Task's method does not operate with alphas less than or equal to `.01`, so we don't use any at or below that threshold. We are comparing our critical values to Task's *High Utility* test, so we need to multiply n by .3 in order to find N_r.
+
+```{r args_list}
+n <- c(100, 1000)
+alpha <- c(.1, .05, .025)
+epsilon <- c(1, .1, .01)
+
+args_list <- list(n =       rep(n,
+                                times = length(alpha),
+                                each = length(epsilon)),
+                  alpha =   rep(alpha, 
+                                times = length(n)*length(epsilon)),
+                  epsilon = rep(epsilon,
+                                each = length(n)*length(alpha)))
+
+```
+
+First, we calculate Task's critical values.
+
+```{r task}
+source('wc/fxns/calc_task_crit_val.R')
+
+task_crit_vals <- pmap(.l = args_list,
+                       .f = calc_task_crit_val) %>%
+                  unlist()
+```
+
+Now, we will calculate our critical values using simulation.
+
+```{r calc_new_crit_val}
+calc_new_crit_val <- function(n, epsilon, alpha, reps) {
+  # find the sd of the laplace at the given n
+  s <- sqrt(n*(n+1)*(2*n+1)/6)
+  # simulate a vector of noise
+  noise <- rlaplace(n = reps,
+                    m = 0,
+                    s = 2*n/(epsilon))
+  # simulate a vector of test statistics
+  W <- rnorm(n = reps,
+             mean = 0,
+             sd = s)
+  # calculate privatize test statistics
+  W_priv <- noise + W
+  # find critical value from the W distribution
+  w <- quantile(W_priv, probs = 1 - alpha)
+  # convert to a standardized Z value
+  w/s
+}
+```
+
+Map `args_list` over `calc_new_crit_val` to get a vector of our critical values at the given parameters.
+
+```{r new_crit_vals_W}
+new_crit_vals <- pmap(.l = args_list,
+                      .f = calc_new_crit_val,
+                      reps = 1e7) %>%
+                 unlist()
+```
+
+Finally, we need to find the public critical values. This will be simpler, as the public critical values do not vary as a function of `n` or `epsilon`.
+
+```{r}
+public_crit_vals <- rep(qnorm(1 - c(.1, .05, .025)), 
+                        times = length(n)*length(epsilon))
+```
+
+Now, we put together and save the master table.
+
+```{r master_table}
+# bind together the arguments and critical values
+crit_val_comp_table <- cbind(bind_rows(args_list), 
+                             Public = public_crit_vals,
+                             New = new_crit_vals,
+                             Task = task_crit_vals)
+```
+
+We now need to do some formatting and "untidying" in order to get the tables to appear how we want.
+
+```{r}
+# reorder and rename the columns
+crit_val_comp_table <- select(crit_val_comp_table,
+                              '$\\epsilon$' = epsilon,
+                              '$\\alpha$' = alpha,
+                              Public,
+                              New,
+                              Task,
+                              n = n)
+
+# make the epsilon and alpha columns into factors in 
+# order to display the right amount of digits
+crit_val_comp_table$'$\\epsilon$' <- as.factor(crit_val_comp_table$'$\\epsilon$')
+crit_val_comp_table$'$\\alpha$' <-   as.factor(crit_val_comp_table$'$\\alpha$')
+
+# round the critical value vectors to 3 digits
+crit_val_comp_table$Public <- round(crit_val_comp_table$Public, 
+                                    digits = 3)
+crit_val_comp_table$Task <-   round(crit_val_comp_table$Task, 
+                                    digits = 3)
+crit_val_comp_table$New <-    round(crit_val_comp_table$New, 
+                                    digits = 3)
+```
+
+Subset and save the table for `n = 100`.
+
+```{r save_n_1000}
+# filter only rows where n = 100 and get rid of the n column
+n_100_crit_val_comp_table <- filter(crit_val_comp_table,
+                                    n == 100) %>%
+                             select(-n)
+
+
+# get rid of repetitive epsilons (chart junk)
+n_100_crit_val_comp_table$'$\\epsilon$'[n_100_crit_val_comp_table$'$\\alpha$' != 0.100] <- " "
+
+# convert to xtable
+n_100_crit_val_comp_table <- n_100_crit_val_comp_table %>% 
+                             xtable(display = c(rep("s", 3),
+                                                rep("f", 3)),
+                                    digits = 3)
+
+# save the table in .tex format
+print.xtable(n_100_crit_val_comp_table, 
+             file = "figures/wc_vs_task_crit_val_n100.tex",
+             include.rownames = FALSE,
+             hline.after = c(-1, 0, 3, 6, 9),
+             sanitize.colnames.function = function(x) x)
+
+```
+
+Do the same for `n = 1000`.
+
+```{r save_n_100}
+# filter only rows where n = 1000 and get rid of the n column
+n_1000_crit_val_comp_table <- filter(crit_val_comp_table,
+                                    n == 1000) %>%
+                             select(-n)
+
+# get rid of repetitive epsilons (chart junk)
+n_1000_crit_val_comp_table$'$\\epsilon$'[n_1000_crit_val_comp_table$'$\\alpha$' != 0.100] <- " "
+
+# convert to xtable
+n_1000_crit_val_comp_table <- n_1000_crit_val_comp_table %>% 
+                             xtable(display = c(rep("s", 3),
+                                                rep("f", 3)),
+                                    digits = 3)
+
+# save the table in .tex format
+print.xtable(n_1000_crit_val_comp_table, 
+             file = "figures/wc_vs_task_crit_val_n1000.tex",
+             include.rownames = FALSE,
+             hline.after = c(-1, 0, 3, 6, 9),
+             sanitize.colnames.function = function(x) x)
+
+```

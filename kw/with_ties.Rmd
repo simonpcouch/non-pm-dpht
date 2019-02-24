@@ -1,0 +1,257 @@
+---
+output: github_document
+---
+# Kruskal-Wallis Power Analysis
+#### *The Effect of Ties and Tiebreaking on Power*
+
+This file analyzes the power of our DP Kruskal-Wallis test when observations in the sample data are tied.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(plyr)
+library(tidyverse)
+library(rmutil)
+```
+
+Some of the functions used in this document are used, unedited, in several other documents throughout the power analysis. We load them now---documentation for each can be found in the relevant files in the `fxns` folder.
+
+```{r}
+source('kw/fxns/kw.R')
+source('kw/fxns/kw_new.R')
+```
+
+Note that, as opposed to other documents in this repo, this `.Rmd` does not source the `gen_data` and `calc_stat` functions from the `fxns` folder. The framework of data generation and test statistic calculation changes slightly when we introduce ties.
+
+`gen_data` randomly generates data to be supplied to the `kw` or `kw_new` function, as well as noise for private trials. 
+
+* `n`, `mean`, `sd`: A vector (length h) of desired sample sizes, means, and standard deviations, respectively. Note that all three of these arguments must be of the same length.
+* `mult`: A list of numerics to round values in the `x` column to, in order to introduce ties into the data.
+* `reps`: The desired number of test statistics to be calculated from the output
+* `epsilon`: The privacy parameter to generate the `noise` column with. Supply `epsilon = NA` for the public test (a noise column will not be generated)
+* `kw_version`: Either "sq" (referring to the regular H statistic) or "abs" (referring to the unsquared absolute value H statistic) s.t. noise with the appropriate sensitivity can be generated.
+
+```{r gen_data}
+gen_data <- function(n, mult, mean, sd, reps, epsilon, kw_version) {
+  if (is.na(epsilon)) { # procedure for the public test
+df <-  data_frame(x = rnorm(n = reps*sum(n), 
+                            mean = rep(rep(mean, n), reps),
+                            sd = rep(rep(sd, n), reps)),
+                  x_rounded = round_any(x, mult),
+                  group = rep(rep(1:length(n), n), reps),
+                  replicate = as.factor(rep(1:reps, each = sum(n))))
+  } else { # procedure for the private test
+      # generate noise depending on the kw_version
+      if (kw_version == "sq") {
+df <- data_frame(x = rnorm(n = reps*sum(n), 
+                           mean = rep(rep(mean, n), reps),
+                           sd = rep(rep(sd, n), reps)),
+                 x_rounded = round_any(x, mult),
+                 group = rep(rep(1:length(n), n), reps),
+                 replicate = as.factor(rep(1:reps, each = sum(n))),
+                 noise = rep(rlaplace(n = reps,
+                                      m = 0,
+                                      s = 78/epsilon), 
+                             each = sum(n)))
+      } else if (kw_version == "abs") {
+df <- data_frame(x = rnorm(n = reps*sum(n), 
+                       mean = rep(rep(mean, n), reps),
+                       sd = rep(rep(sd, n), reps)),
+                 x_rounded = round_any(x, mult),
+                 group = rep(rep(1:length(n), n), reps),
+                 replicate = as.factor(rep(1:reps, each = sum(n))),
+                 noise = rep(rlaplace(n = reps,
+                                      m = 0,
+                                      s = 8/epsilon), 
+                             each = sum(n)))
+      }
+  }
+  return(list(df, kw_version))
+}
+
+```
+
+`calc_stat` takes in a dataframe outputted by `gen_data` and simply calls the `kw` or `kw_new` function for each unique `replicate` value. The output is a distribution of test statistics.
+
+```{r calc_stat}
+calc_stat <- function(data) {
+  if (data[[2]] == "abs" & "noise" %in% colnames(data[[1]])) { 
+    # carry out the private abs version
+    data[[1]] %>%
+      dplyr::group_by(noise) %>%
+      dplyr::summarize(stat = kw_new(x_rounded, group, public = FALSE) + noise[1], 
+                       na.rm = TRUE) %>%
+      dplyr::select(stat) %>%
+      pull()
+  } else if (data[[2]] == "sq" & "noise" %in% colnames(data[[1]])) { 
+    # carry out the private sq version
+    data[[1]] %>%
+      dplyr::group_by(noise) %>%
+      dplyr::summarize(stat = kw(x_rounded, group, public = FALSE) + noise[1], 
+                       na.rm = TRUE) %>%
+      dplyr::select(stat) %>%
+      pull()    
+  } else if (data[[2]] == "sq") { 
+    # carry out the public sq version
+    data[[1]] %>% 
+      dplyr::group_by(replicate) %>%
+      dplyr::summarize(stat = kw(x_rounded, group, public = TRUE)) %>%
+      dplyr::select(stat) %>%
+      pull()
+  } else if (data[[2]] == "abs") { 
+    # carry out the public abs version
+    data[[1]] %>% 
+      dplyr::group_by(replicate) %>%
+      dplyr::summarize(stat = kw_new(x_rounded, group, public = TRUE)) %>%
+      dplyr::select(stat) %>%
+      pull()
+  }
+}
+```
+
+Because we can not explicitly specify the proportion of ties we would like to introduce into the data, we use various rounding multiples to round values in `x` to in order to introduce some proportion of ties. `prop_tied`, then, takes in the output of `gen_data` (a list of a dataframe and a `kw_version`) and finds the proportion of observations in the `x_rounded` column of the dataframe that are tied per trial of `kw`, using the metric of 1 minus the Gini coefficient of the data, and then finds the average per trial.
+
+```{r prop_tied}
+prop_tied <- function(data) {
+  data[[1]] %>%
+  dplyr::group_by(replicate) %>%
+  dplyr::summarize(prop = 1 - sum(table(x_rounded)/length(x_rounded) * (1 - table(x_rounded)/length(x_rounded)))) %>%
+  dplyr::summarize(mean(prop)) %>%
+  pull()
+}
+```
+
+`pwr_plot` is a wrapper function that vectorizes the functions defined above over several combinations of sample sizes and rounding multiples.
+
+* `sizes`: A list of numeric vectors of length x, indicating the sample sizes to carry out the test with. Each element of the list must be the same length.
+* `mult`: A list of numerics—the multiples to round values in `x` to in order to introduce ties into the data. 
+* `epsilon`: A numeric indiciating the privacy parameter.
+* `kw_version`: A character vector: either "sq" (referring to the regular H statistic), or "abs" (referring to the unsquared absolute value H statistic) so that noise with the appropriate sensitivity can be generated.
+* arguments beginning with `mean` and `sd` are vectors of length x, indicating the parameters to generate data for the alternate and null distribution for.
+* `reps`: A numeric indicating the number of repititions to carry out the simulations with.
+* `alpha`: A numeric indicating the significance level to carry the test out with.
+
+```{r pwr_plot}
+pwr_plot <- function(sizes, mult, epsilon, kw_version, mean_null, sd_null, mean_alt, sd_alt, reps, alpha) {
+   
+ # we first create a list of lists, (can be thought of as a dataframe where
+ # each row is a unique combination of sizes and rounding multiple)
+  arg_list <- list(n =    rep(sizes, each = length(mult)), 
+                   mult = rep(mult, times = length(sizes)))
+
+# we need to do the same for the simulation of the reference distribution,
+# where we assume equal group sizes
+  null_sizes_1d <- lapply(sizes, mean) %>% lapply(., ceiling)
+  null_sizes    <- lapply(1:length(null_sizes_1d), 
+                          function(x) {rep(null_sizes_1d[[x]], 3)})  
+  
+  arg_list_null <- list(n =    rep(sizes, each = length(mult)), 
+                        mult = rep(mult, times = length(sizes)))  
+    
+# simulate null distributions with varying parameters and then calculate test 
+# statistics from the null distributions. the output, null_stats is a 
+# dataframe, where each row is a distinct combination of sizes and rounding multiple
+  
+  null_stats <- pmap(.l = arg_list_null,
+                 .f = gen_data,
+                 mean = mean_null,
+                 sd = sd_null, 
+                 reps = reps,
+                 epsilon = epsilon,
+                 kw_version = kw_version) %>%
+                map_dfc(.x = ., .f = calc_stat)
+
+# calculate critical values for each combination of sizes and rounding multiple
+  
+  crit_vals  <-   map(null_stats, quantile, probs = 1 - alpha) %>% 
+                  unlist(use.names = FALSE)
+  
+# simulate alternate distributions with varying parameters and then calculate test 
+# statistics from the alternate distributions. the output, alt_stats, is a 
+# dataframe, where each row is a distribution of test statistics for each
+# distinct combination of sizes and rounding multiple
+  
+  alt_data <- pmap(.l = arg_list,
+                    .f = gen_data,
+                    mean = mean_alt,
+                    sd = sd_alt, 
+                    reps = reps,
+                    epsilon = epsilon,
+                    kw_version = kw_version)
+  alt_stats <- map_dfc(.x = alt_data, .f = calc_stat)
+  
+# this is a vector of powers at given sizes and rounding multiple combinations 
+   
+  power_vector <- map2(.x = crit_vals, .y = alt_stats, .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+  
+# make a list of the total sample size for each element of sizes 
+  N_list <- rep(lapply(sizes, sum), 
+                each = length(mult))  
+
+# find the proportion of ties in the alternate distribution
+  prop_tied_vector <- map(alt_data, prop_tied) %>% unlist()
+  
+# put together a dataframe of powers resulting from given parameters
+  plot_df <- cbind(N = unlist(N_list),
+                   power_vector,
+                   prop_tied_vector) %>%
+             as_data_frame()
+
+# check if there are NA's in epsilon; if so, convert to "Public" for plotting
+# plot_df$epsilon[is.na(plot_df$epsilon)] <- "Public"
+}
+```
+
+We now make use of the `pwr_plot` function in order to generate the plot in the paper with the varying proportion of ties.
+
+```{r usage}
+# make a vector of sample sizes
+sizes_1d <- c(40, 60, 80) %>% as.list()
+sizes <- lapply(1:length(sizes_1d), function(x) {rep(sizes_1d[[x]], 3)})
+
+# simulate plot data
+kw_with_ties <- pwr_plot(sizes = sizes,
+         mult = list(.01, .1, .5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 10),
+         kw_version = "abs",
+         mean_null = c(0, 0, 0),
+         sd_null = c(1, 1, 1),
+         mean_alt = c(-1, 0, 1),
+         sd_alt = c(1, 1, 1),
+         epsilon = 1,
+         reps = 1e4,
+         alpha = .05)
+
+# save plot data
+save(kw_with_ties, file = "kw/data/kw_with_ties.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# plot the data
+kw_with_ties_plot <- ggplot(kw_with_ties) + 
+    geom_line(aes(x = prop_tied_vector, 
+                  y = power_vector, 
+                  col = as.factor(N)),
+              size = 1.3) +
+    labs(x = "Proportion of Ties", y = "Power") +
+    scale_color_manual(name = "Total Sample \nSize n",
+                       values = colors) +
+    scale_linetype_discrete(name = "Test Type") +
+    theme_minimal(base_family = "Times",
+                  base_size = 24) +
+    theme(axis.line = element_line(colour = "black"))
+
+kw_with_ties_plot
+
+# save the plot
+ggsave(filename = "kw_with_ties.png", 
+       plot = kw_with_ties_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```

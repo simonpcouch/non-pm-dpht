@@ -1,0 +1,72 @@
+---
+output: github_document
+---
+
+# T-Test Power Analyses
+#### *Comparing Hypothesis Testing Options in the Paired Setting*
+
+This file serves to join the data from our Wilcoxon and t-tests in order to make comparative plots of the 2 tests.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(latex2exp)
+```
+
+We'll standardize the data to 3 columns--the test, difference set size, and power so that we can join them together.
+
+```{r}
+# load the t-test data
+load("t/data/t_no_ties.Rda")
+
+new_t_data <- t_no_ties %>%
+  select(epsilon, sizes, power) %>%
+  mutate(test = "T")
+
+# load the wilcoxon data
+load("wc/data/wc_no_ties.Rda")
+
+wilcoxon_data <- wc_no_ties %>%
+  mutate(test = "Wilcoxon") %>%
+  mutate(true_sizes = sizes/2) %>%
+  select(epsilon, sizes = true_sizes, test, power)
+
+master_paired_data <- rbind(wilcoxon_data, new_t_data)
+```
+
+```{r plot}
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#ece900", "#05e200", "#dd02e0")
+
+# plot the data
+wc_vs_task_plot <- ggplot(master_paired_data) + 
+    geom_line(aes(x = sizes, 
+                  y = power,
+                  col = as.factor(epsilon),
+                  linetype = as.factor(test)),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", y = "Power") +
+    scale_color_manual(name = TeX("$\\epsilon$"),
+                       values = colors[c(1, 3, 4, 2)]) +
+    scale_linetype_manual(name = "Test",
+                       values = c("solid", "dotted"),
+                       labels = c(unname(TeX(c("\\widetilde{T}"))), unname(TeX(c("\\widetilde{KW}abs"))))) +
+    scale_x_log10() +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+wc_vs_task_plot
+
+# save the plot
+ggsave(filename = "wc_vs_task.png", 
+       plot = wc_vs_task_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```

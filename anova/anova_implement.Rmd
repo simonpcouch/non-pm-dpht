@@ -1,0 +1,1033 @@
+---
+output: github_document
+---
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Kruskal-Wallis Power Analysis
+#### *DP ANOVA Implementation & Comparison*
+
+This file serves to implement a previously developed differentially private ANOVA test from Swanberg et. al. for comparison to our new Kruskal-Wallis test. We also run the DP ANOVA in the 2-group setting and compare to our Mann-Whitney. The majority of the code implementing their test has been left as provided by the authors--we note where this is not the case.
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+library(latex2exp)
+```
+
+** Their code begins here.**
+
+```{r datagen}
+#' generates N draws from differing normal distributions with same variance for
+#' each iteration, parallelized with iteration counts.
+#' 
+#' @param N database size
+#' @param mus vector of means for each group
+#' @param sigma standard deviation of each group
+#' @param reps number of runs/iterations
+#' @param p vector of group sizes, uniform by default
+
+datagen <- function(N, mus, sigma, reps = 1 , sizes = rep(1,length(mus))){
+  if (length(sizes) != length(mus)) 
+    stop("length's of means and relative group sizes differ")
+  sizes <- sizes/sum(sizes)
+  data.frame(y=rnorm(N*reps,
+                     mean = rep(rep(mus, round(N*sizes)), reps),
+                     sd = rep(sigma, N*reps)),
+             group=(rep(rep(1:length(sizes), round(N*sizes)), reps)),
+             iteration=rep(1:reps,rep(N,reps))
+  )
+}
+
+#' scales data to the unit interval and then truncates data by bounds
+#' 
+#' @param D a dataframe from datagen
+#' @param bound a vector of a lower and upper bounds
+
+scale_to_unit <- function(D, bounds){
+  D$y <- ((D$y - min(bounds))/abs(bounds[1]-bounds[2])) %>%
+    pmin(1) %>%
+    pmax(0)
+  D
+}
+```
+
+```{r helpers}
+group_sizes <- function(D){
+  D %>%
+    filter(iteration==1) %>%
+    group_by(group) %>%
+    summarise(n_size = n()) %>%
+    pull(n_size)
+}
+
+group_means_mat <- function(D, it){
+  D %>%
+    group_by(iteration, group) %>%
+    mutate(mean_ij = mean(y)) %>%
+    pull(mean_ij) %>%
+    matrix(nrow = it, byrow = TRUE)
+}
+
+grand_means <- function(D){
+  D %>%
+    group_by(iteration) %>%
+    summarise(mean = mean(y)) %>%
+    pull(mean)
+}
+
+SSE_calc <- function(D, it){
+  D %>%
+    group_by(iteration, group) %>%
+    mutate(ybar_j = mean(y),
+           sqdiff = (y - ybar_j)^2) %>%
+    pull(sqdiff) %>%
+    matrix(ncol = it) %>%
+    colSums()
+}
+
+SE_calc <- function(D, it){
+  D %>%
+    group_by(iteration, group) %>%
+    mutate(ybar_j = mean(y),
+           absdiff = abs(y - ybar_j)) %>%
+    pull(absdiff) %>%
+    matrix(ncol = it) %>%
+    colSums()
+}
+
+Var2_calc <- function(D){
+  D %>%
+    group_by(iteration) %>%
+    summarise(Var2 = (y-mean(y))^2 %>% sum) %>%
+    pull(Var2)
+}
+
+Var1_calc <- function(D){
+  D %>%
+    group_by(iteration) %>%
+    summarise(Var1 = abs(y-mean(y)) %>% sum) %>%
+    pull(Var1)
+}
+
+VarP_calc <- function(D, p){
+  D %>%
+    group_by(iteration) %>%
+    summarise(Var1 = (abs(y-mean(y))^p) %>% sum) %>%
+    pull(Var1)
+}
+
+
+SPE_calc <- function(D, it, p){
+  D %>%
+    group_by(iteration, group) %>%
+    mutate(ybar_j = mean(y),
+           absdiff = abs(y - ybar_j)^p) %>%
+    pull(absdiff) %>%
+    matrix(ncol = it) %>%
+    colSums()
+}
+
+#' helper function, omits NAs and finds mean of Bool vector to find power
+na.omit.mean <- function(vec){ 
+  sum(na.omit(vec))/length(vec)
+}
+
+#' helper function, finds critical points of null dists across the colums of a 
+#' matrix of statistics distributed under the null hypothesis
+crit <- function(M){
+  apply(M, 2, quantile,probs = .95)
+}
+
+#` helper function to reduce RAM usage if running with high reps
+combine_power <- function(input){ #expects list of many power matricies, with identical parameters
+  power_mat <-  rep(NA, length(input)) %>% tensor(rep(NA,length(as.vector(input[[1]]))))
+    for(i in 1:length(input)) {
+      for(j in 1:ncol(input[[1]]))
+      power_mat[i,] <- as.vector(input[[i]])
+  }
+  power_mat %>% apply(2, function(x){mean(x)}) %>%
+    matrix(nrow = nrow(input[[1]]))
+}
+```
+
+```{r power_calc}
+#' calculates power for each N,epsilon pair, while generating null hypothesis 
+#' data using true value of sigma
+
+power_calc <- function(Ns, mus, sigma, epsilons, Statistic= NULL, p = 1.5, reps = 1,
+                       frac = .5, sizes = rep(1,length(mus))){
+  Stat <- Varpstat_parallel
+  if(tolower(Statistic) == "fstat"){
+    Stat <- Fstat_parallel
+  }
+  if(tolower(Statistic) == "absfstat"){
+    Stat <- absFstat_parallel
+  }
+  if(tolower(Statistic) == "varstat"){
+    Stat <- Varstat_parallel
+  }
+  if(tolower(Statistic) == "absvarstat"){
+    Stat <- absVarstat_parallel
+  }
+  crit_mat <- Ns %>%
+    map(~ datagen(., rep(.5,length(mus)), sigma, reps, sizes)) %>% 
+    map(~ Stat(., epsilons, frac, p)[,1:(1+length(epsilons))]) %>%
+    sapply(crit) %>%
+    t()
+  altstat <- Ns %>%
+    map(~ datagen(., mus, sigma, reps, sizes))  %>%
+    map(~ Stat(., epsilons, frac, p)[,1:(1+length(epsilons))])
+  power_mat <- rep(NA, length(Ns)*(1+length(epsilons))) %>%
+    matrix(nrow = length(Ns))
+  for (i in 1:(length(Ns))){
+    for (j in 1:(1+length(epsilons))){
+      power_mat[i,j] <- (altstat[[i]][,j] > crit_mat[i,j]) %>%
+        na.omit.mean()
+    }
+  }
+  power_mat
+}
+
+
+
+#' calculates power for each N,epsilon pair, while generating null hypothesis
+#' data using estimate for sigma
+
+power_calc_estimated <- function(Ns, mus, sigma, epsilons, Statistic = NULL,
+                                 p = 1.5, reps = 1, frac = .5,
+                                 sizes = rep(1,length(mus))){
+  Stat <- Varpstat
+  Stat_parallel <- Varpstat_parallel
+  if(tolower(Statistic) == "fstat"){
+    Stat <- Fstat
+    Stat_parallel <- Fstat_parallel
+  }
+  if(tolower(Statistic) == "absfstat"){
+    Stat <- absFstat
+    Stat_parallel <- absFstat_parallel
+  }
+  if(tolower(Statistic) == "varstat"){
+    Stat <- Varstat
+    Stat_parallel <- Varstat_parallel
+  }
+  if(tolower(Statistic) == "absvarstat"){
+    Stat <- absVarstat
+    Stat_parallel <- absVarstat_parallel
+  }
+  epsilons2 <- c(-1, epsilons)       # negative epsilon indicates public stat
+  Reject_mat <- rep(NA, reps*length(epsilons2)) %>%
+    matrix(nrow = reps)
+  power_mat <- rep(NA, length(Ns)*length(epsilons2)) %>%
+    matrix(nrow = length(Ns))
+  for (i in 1:length(Ns)){
+    altstat <- datagen(Ns[i], mus, sigma, reps, sizes) %>%
+      Stat_parallel(epsilons, frac, p)
+    sdevs <- altstat[,(2+length(epsilons)):(2*(1+length(epsilons)))]
+    nullstat <- rep(NA, (1+length(epsilons))*reps) %>%
+      matrix(nrow = reps)
+    for (j in 1:length(epsilons2)){
+      crits <- sdevs[,j] %>%
+        map(~ datagen(Ns[i], rep(.5, length(mus)), ., 300, sizes)) %>%
+        map(~ Stat(., epsilons2[j], frac, p)) %>%
+        map(~ quantile(., probs = .95, na.rm = TRUE)) %>%
+        unlist()
+      Reject_mat[,j] <- (altstat[,j] > crits)
+      power_mat[i,] <- apply(Reject_mat, 2, na.omit.mean)
+    }
+  }
+  power_mat
+}
+```
+
+```{r stat_functions}
+#' Calculates an F statistic for each iteration, using a dataframe from datagen
+#' 
+#' @param D a dataframe from datagen
+#' @param epsilon differential privacy parameter, 
+#' @param frac fraction of differential privacy parameter to allocate to
+#'  numerator
+
+Fstat <- function(D, epsilon, frac = .5, p = NULL){
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                          # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #SSA:
+  SSA <- (group_means_mat(D, it = it) - grand_means(D))^2 %>%   # see helpers.R
+    rowSums()
+  #SSE:
+  SSE <- SSE_calc(D, it = it)                                   # see helpers.R
+  #Noise
+  if (epsilon > 0){
+    SSA_noise <- rlaplace(length(epsilon)*it,
+                          0,
+                          (9+(5/N))/(frac*epsilon))
+    SSE_noise <- rlaplace(length(epsilon)*it,
+                          0,
+                          7/((1-frac)*epsilon))
+    ((SSA+SSA_noise)/(k-1))/((SSE+SSE_noise)/(N-k))
+  }
+  else{
+    (SSA/(k-1))/(SSE/(N-k))
+  }
+}
+
+#' Calculates an absolute value F statistic for each iteration, using a
+#' dataframe from datagen
+#' 
+#' @param D a dataframe from datagen
+#' @param epsilon differential privacy parameter
+#' @param frac fraction of differential privacy parameter to allocate to
+#'  numerator
+
+absFstat <- function(D, epsilon, frac = .5, p = NULL){ 
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                          # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #SA:
+  SA <- abs(group_means_mat(D, it = it) - grand_means(D)) %>%   # see helpers.R
+    rowSums()
+  #SE stuff:
+  SE <- SE_calc(D, it = it)                                     # see helpers.R
+  #Noise
+  if (epsilon > 0){
+    SA_noise <- rlaplace(length(epsilon)*it,
+                         0,
+                         4/(frac*epsilon))
+    SE_noise <- rlaplace(length(epsilon)*it,
+                         0,
+                         3/((1-frac)*epsilon))
+    ((SA+SA_noise)/(k-1))/((SE+SE_noise)/(N-k))
+  }
+  else{
+    ((SA)/(k-1))/((SE)/(N-k))
+  }
+}
+
+#' Calculates an F statistic and sigma estimate for each iteration and each 
+#' epsilon, using a dataframe from datagen. Public statistics (epsilon =
+#' infinity) are calculated by default and placed in the first column. Output
+#' matrix rows are indexed on iteration number, and columns are indexed by
+#' epsilon. Sigma estimates are indexed with their respective statistics on the
+#' right half of the matrix.
+#' 
+#' @param D a dataframe from datagen
+#' @param epsilon differential privacy parameter
+#' @param frac fraction of differential privacy parameter to allocate to
+#'  numerator
+
+Fstat_parallel <- function(D, epsilons, frac = .5, p = NULL){
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                          # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #SSA:
+  SSA <- (group_means_mat(D, it = it) - grand_means(D))^2 %>%   # see helpers.R
+    rowSums()
+  #SSE:
+  SSE <- SSE_calc(D, it = it)                                   # see helpers.R
+  #Noise
+  SSA_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,(9+(5/N))/(frac*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  SSE_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,7/((1-frac)*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  ANS <- rep(NA,2*it*(1+length(epsilons))) %>% matrix(ncol = 2*(1+length(epsilons)))
+  for (i in 1:(1+length(epsilons))){
+    ANS[,i] <- ((SSA+SSA_noise[i,])/(k-1))/((SSE+SSE_noise[i,])/(N-k))
+    ANS[,i+1+length(epsilons)] <- ((SSE+SSE_noise[i,])/(N-k)) %>% sqrt
+  }
+  ANS
+}
+
+#' Calculates an abs F statistic and sigma estimate for each iteration and each 
+#' epsilon, using a dataframe from datagen. Public statistics (epsilon =
+#' infinity) are calculated by default and placed in the first column. Output
+#' matrix rows are indexed on iteration number, and columns are indexed by
+#' epsilon. Sigma estimates are indexed with their respective statistics on the
+#' right half of the matrix.
+#' 
+#' @param D a dataframe from datagen
+#' @param epsilon differential privacy parameter
+#' @param frac fraction of differential privacy parameter to allocate to
+#'  numerator
+
+absFstat_parallel <- function(D,epsilons, frac = .5, p = NULL){ 
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                          # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #SA:
+  SA <- abs(group_means_mat(D, it = it) - grand_means(D)) %>%   # see helpers.R
+    rowSums()
+  #SE stuff:
+  SE <- SE_calc(D, it = it)                                     # see helpers.R
+  #Noise
+  SA_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,4/(frac*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  SE_noise <- rep(0,length(it)) %>%
+    rbind(rlaplace(length(epsilons)*it,0,3/((1-frac)*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  ANS <- rep(NA,2*it*(1+length(epsilons))) %>% matrix(nrow = it)
+  for (i in 1:(1+length(epsilons))){
+    ANS[,i] <- ((SA+SA_noise[i,])/(k-1))/((SE+SE_noise[i,])/(N-k))
+    ANS[,i+1+length(epsilons)] <- ((SE+SE_noise[i,])/(N-k))*sqrt(pi/2)
+  }
+  ANS
+}
+
+### Variance Statistics
+Varstat <- function(D,epsilon, frac = .5, p = NULL){
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                          # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #Var2 stuff:
+  Var2 <- Var2_calc(D)                                          # see helpers.R
+  #SSE stuff:
+  SSE <- SSE_calc(D, it = it)                                   # see helpers.R
+  #Noise
+  if (epsilon > 0){
+    Var2_noise <- rlaplace(length(epsilon)*it,0,(5+(5/N)+1/(N^2))/(frac*epsilon))
+    SSE_noise <- rlaplace(length(epsilon)*it,0,7/((1-frac)*epsilon))
+    ((Var2+Var2_noise)/(N-1))/((SSE+SSE_noise)/(N-k))
+  }
+  else{
+    ((Var2)/(N-1))/((SSE)/(N-k))
+  }
+}
+
+absVarstat <- function(D,epsilon, frac = .5, p = NULL){
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                          # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #Var1:
+  Var1 <- Var1_calc(D)                                          # see helpers.R
+  #SE stuff:
+  SE <- SE_calc(D, it = it)                                     # see helpers.R
+  #Noise
+  if (epsilon > 0){
+    Var1_noise <- rlaplace(length(epsilon)*it,0,(2-2/N)/(frac*epsilon))
+    SE_noise <- rlaplace(length(epsilon)*it,0,3/((1-frac)*epsilon))
+    ((Var1+Var1_noise)/(N-1))/((SE+SE_noise)/(N-k))
+  }
+  else{
+    ((Var1)/(N-1))/((SE)/(N-k))
+  }
+}
+
+Varstat_parallel <- function(D,epsilons, frac = .5, p = NULL){
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                          # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #Var2 stuff:
+  Var2 <- Var2_calc(D)                                          # see helpers.R
+  #SSE stuff:
+  SSE <- SSE_calc(D, it = it)                                   # see helpers.R
+  #Noise
+  Var2_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,(5+(5/N)+1/(N^2))/(frac*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  SSE_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,7/((1-frac)*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  ANS <- rep(NA,2*it*(1+length(epsilons))) %>% matrix(ncol = 2*(1+length(epsilons)))
+  for (i in 1:(1+length(epsilons))){
+    ANS[,i] <- ((Var2+Var2_noise[i,])/(N-1))/((SSE+SSE_noise[i,])/(N-k))
+    ANS[,i+1+length(epsilons)] <- ((Var2+Var2_noise[i,])/(N-1)) %>% sqrt
+  }
+  ANS
+}
+
+absVarstat_parallel <- function(D,epsilons, frac = .5, p = NULL){
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                          # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #Var1:
+  Var1 <- Var1_calc(D)                                          # see helpers.R
+  #SE stuff:
+  SE <- SE_calc(D, it = it)                                     # see helpers.R
+  #Noise
+  Var1_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,(2-2/N)/(frac*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  SE_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,3/((1-frac)*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  ANS <- rep(NA,2*it*(1+length(epsilons))) %>% matrix(ncol = 2*(1+length(epsilons)))
+  for (i in 1:(1+length(epsilons))){
+    ANS[,i] <- ((Var1+Var1_noise[i,])/(N-1))/((SE+SE_noise[i,])/(N-k))
+    ANS[,i+1+length(epsilons)] <- ((Var1+Var1_noise[i,])/(N-1))*sqrt(pi/2)
+  }
+  ANS
+}
+
+# Fp Statistic
+Fpstat <- function(D, epsilon, frac = .5, p = 1){ 
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                           # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #SPA:
+  SPA <- (abs(group_means_mat(D, it = it) - grand_means(D))^p) %>%  # see helpers.R
+    rowSums()
+  #SPE stuff:
+  SPE <- SPE_calc(D, it = it, p = p)                             # see helpers.R
+  #Noise
+  if(p < 1){
+    SPA_sensitivity <- ((N*(3/N)^p)+1)
+    SPE_sensitivity <- ((2*(N/2)^(1-p))+1)
+  }
+  else{
+    SPA_sensitivity <- (N * (1-((1 - (3/N))^p))) + 1
+    SPE_sensitivity <- (N * (1-((1 - (2/N))^p))) + 1
+  }
+  if (epsilon > 0){
+    SPA_noise <- rlaplace(length(epsilon)*it,
+                         0,
+                         SPA_sensitivity/(frac*epsilon))
+    SPE_noise <- rlaplace(length(epsilon)*it,
+                         0,
+                         SPE_sensitivity/((1-frac)*epsilon))
+    ((SPA+SPA_noise)/(k-1))/((SPE+SPE_noise)/(N-k))
+  }
+  else{
+    ((SPA)/(k-1))/((SPE)/(N-k))
+  }
+}
+  
+Fpstat_parallel <- function(D,epsilons, frac = .5, p = 1){ 
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                           # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #SPA:
+  SPA <- (abs(group_means_mat(D, it = it) - grand_means(D))^p) %>% # see helpers.R
+    rowSums()
+  #SPE stuff:
+  SPE <- SPE_calc(D, it = it, p = p)                             # see helpers.R
+  #Noise
+  if(p < 1){
+    SPA_sensitivity <- ((N*(3/N)^p)+1)
+    SPE_sensitivity <- ((2*(N/2)^(1-p))+1)
+  }
+  else{
+    SPA_sensitivity <- (N * (1-((1 - (3/N))^p))) + 1
+    SPE_sensitivity <- (N * (1-((1 - (2/N))^p))) + 1
+  }
+  SPA_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,SPA_sensitivity/(frac*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  SPE_noise <- rep(0,length(it)) %>%
+    rbind(rlaplace(length(epsilons)*it,0,SPE_sensitivity/((1-frac)*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  ANS <- rep(NA,2*it*(1+length(epsilons))) %>% matrix(nrow = it)
+  for (i in 1:(1+length(epsilons))){
+    ANS[,i] <- ((SPA+SPA_noise[i,])/(k-1))/((SPE+SPE_noise[i,])/(N-k))
+    ANS[,i+1+length(epsilons)] <- ((SPE+SPE_noise[i,])/(N-k))*sqrt(pi/2)
+  }
+  ANS
+}
+
+Varpstat <- function(D, epsilon, frac = .5, p = 1){ 
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                           # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #SPV:
+  SPV <- VarP_calc(D, p = p)
+  #SPE stuff:
+  SPE <- SPE_calc(D, it = it, p = p)                             # see helpers.R
+  #Noise
+  if(p < 1){
+    SPV_sensitivity <- 1 + (N-1)/(N^p)
+    SPE_sensitivity <- ((2*(N/2)^(1-p))+1)
+  }
+  else{
+    SPV_sensitivity <- (N - 1)*(1-((1-(1/N))^p)) + 1
+    SPE_sensitivity <- (N * (1-((1 - (2/N))^p))) + 1
+  }
+  if (epsilon > 0){
+    SPV_noise <- rlaplace(length(epsilon)*it,
+                          0,
+                          SPV_sensitivity/(frac*epsilon))
+    SPE_noise <- rlaplace(length(epsilon)*it,
+                          0,
+                          SPE_sensitivity/((1-frac)*epsilon))
+    ((SPV+SPV_noise)/(k-1))/((SPE+SPE_noise)/(N-k))
+  }
+  else{
+    ((SPV)/(k-1))/((SPE)/(N-k))
+  }
+}
+
+Varpstat_parallel <- function(D,epsilons, frac = .5, p = 1){ 
+  D$y <- D$y %>% pmin(1) %>% pmax(0)
+  it <- max(D$iteration)
+  ns <- group_sizes(D)                                           # see helpers.R
+  k <- length(ns)
+  N <- sum(ns)
+  #SPV:
+  SPV <- VarP_calc(D, p = p)                                     # see helpers.R
+  #SPE stuff:
+  SPE <- SPE_calc(D, it = it, p = p)                             # see helpers.R
+  #Noise
+  if(p < 1){
+    SPV_sensitivity <- 1 + (N-1)/(N^p)
+    SPE_sensitivity <- ((2*(N/2)^(1-p))+1)
+  }
+  else{
+    SPV_sensitivity <- (N - 1)*(1-((1-(1/N))^p)) + 1
+    SPE_sensitivity <- (N * (1-((1 - (2/N))^p))) + 1
+  }
+  SPV_noise <- rep(0,length(it)) %>% 
+    rbind(rlaplace(length(epsilons)*it,0,SPV_sensitivity/(frac*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  SPE_noise <- rep(0,length(it)) %>%
+    rbind(rlaplace(length(epsilons)*it,0,SPE_sensitivity/((1-frac)*epsilons)) %>%
+            matrix(nrow = length(epsilons)))
+  ANS <- rep(NA,2*it*(1+length(epsilons))) %>% matrix(nrow = it)
+  for (i in 1:(1+length(epsilons))){
+    ANS[,i] <- ((SPV+SPV_noise[i,])/(k-1))/((SPE+SPE_noise[i,])/(N-k))
+    ANS[,i+1+length(epsilons)] <- ((SPV+SPV_noise[i,])/(N-k))*sqrt(pi/2)
+  }
+  ANS
+}
+```
+
+```{r power_plot}
+power_plot <- function(Ns, mus, sigma, epsilons, Statistic = 1, p = 1, reps,
+                       frac=.5, sizes = rep(1, length(mus))) { 
+  
+  # find a vector of powers at given epsilon and N combinations
+  pow <- power_calc(Ns, mus, sigma, epsilons, Statistic, p, reps, frac, sizes) 
+  
+  # make a dataframe of powers and parameters used to find them
+  d <- data.frame(N= rep(Ns,rep(1+length(epsilons),length(Ns))),
+                  eps = rep(c("None",epsilons),length(Ns)),
+                  Power=pow %>% t %>% as.vector())
+}
+
+power_plot_estimated <- function(sizes = rep(1, length(mus)), Ns, mus, sigma, epsilons, Statistic = 1,
+                                 p = 1, reps, frac=.5) {
+  
+  #plot power against database size, for each N,epsilon pair, using estimated sd
+  pow <- power_calc_estimated(Ns, mus, sigma, epsilons, Statistic, p = 1, reps,
+                              frac, sizes = sizes) 
+  
+  d <- data.frame(N = rep(Ns,rep(1+length(epsilons), length(Ns))),
+                  eps = rep(c("None",epsilons), length(Ns)),
+                  Power = pow %>% t() %>% as.vector())
+  
+  d
+}
+```
+
+**Their code ends here.**
+
+Note that we modify their code to save the plot *data*, not the plot itself. We also modify the implementation of the `sizes` argument in `power_plot_estimated`. 
+
+Then, we run the code with the same parameters used in the noncomparative, no-ties figure, so that we can compare it to our test. 
+
+```{r 3gp}
+# choose sample sizes s.t. values are evenly spaced when plotted on
+# a log 10 scale (except for N < 200, as power will be 0)
+
+# round_any is from plyr(), don't actually load it because
+# of namespace conflicts with dplyr's 'select'
+# sizes <- seq(from = 1.25, to = 2.01, by = .04)^10 %>% round_any(3)
+
+sizes <- c(9, 12, 18, 24, 30, 42, 54, 69, 90, 117, 150, 189, 
+           240, 303, 378, 471, 582, 717, 879, 1077)
+
+# generate plot data for the private anova
+anova_only <- power_plot_estimated(Ns = sizes, 
+                                mus = c(.35, .5, .65), 
+                                sigma = .15, 
+                                epsilon = 1, 
+                                Statistic = "absFstat", 
+                                p = NULL, 
+                                reps = 1e3, 
+                                frac = .75)
+
+# save the private ANOVA data
+save(anova_only, file = "anova/data/anova_only.Rda")
+
+# generate data for the public, squared (normal) anova
+anova_only_pub <- power_plot_estimated(Ns = sizes, 
+                                mus = c(.35, .5, .65), 
+                                sigma = .15, 
+                                epsilon = 1, 
+                                Statistic = "Fstat", 
+                                p = NULL, 
+                                reps = 1e3, 
+                                frac = .5)
+
+# save the public ANOVA data
+save(plot_df_anova_for_pub, file = "anova/data/anova_only_pub.Rda")
+
+# convert the plot data to same format as the new test
+plot_df_anova_new <- anova_only %>%
+    filter(eps == 1) %>%
+    select(N = N,
+           power_vector = Power) %>%
+    mutate(test_type = "Private ANOVA")
+
+# do the same with the public data
+plot_df_anova_pub <- anova_only_pub %>%
+    filter(eps == "None") %>%
+    select(N = N,
+           power_vector = Power) %>%
+    mutate(test_type = "Public ANOVA")
+
+# load and transform the Kruskal Wallis data
+load("kw/data/kw_no_ties.Rda")
+
+plot_df_new <- kw_no_ties %>%
+  filter(epsilon == 1 & kw_version == "abs" & N < 1077) %>%
+  select(N, power_vector) %>%
+  mutate(test_type = "New KW")
+
+plot_df_pub <- kw_no_ties %>%
+  filter(epsilon == "Public" & kw_version == "sq" & N < 1077) %>%
+  select(N, power_vector) %>%
+  mutate(test_type = "Public KW")
+
+# put together a plotting dataframe of all of the tests
+kw_vs_anova <- rbind(plot_df_anova_new,
+                       plot_df_anova_pub,
+                       plot_df_new,
+                       plot_df_pub)
+
+# save the final plot data
+save(kw_vs_anova, file = "anova/data/kw_vs_anova.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# plot the data
+kw_vs_anova_plot <- ggplot(kw_vs_anova) +
+    geom_line(aes(x = N, 
+                  y = power_vector, 
+                  col = as.factor(test_type)),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", 
+         col = "Test Type", 
+         y = "Power") +
+    scale_x_log10() +
+    theme_minimal(base_size = 24,
+                  base_family = "Times") + 
+    scale_color_manual(values = colors, labels = c(unname(TeX(c("$\\widetilde{KW}_{abs}$"))),
+                                  "Swanberg", 
+                                  "ANOVA", 
+                                  "KW")) +
+    theme(axis.line = element_line(colour = "black"))
+
+kw_vs_anova_plot    
+    
+# save the plot
+ggsave(filename = "kw_vs_anova.png", 
+       plot = kw_vs_anova_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+
+We will also use the 2-group DP ANOVA as the best prior work to compare our Mann-Whitney test to. The procedure follows identically to the above chunk.
+
+```{r 3gp}
+# choose sample sizes s.t. values are evenly spaced when plotted on
+# a log 10 scale (except for N < 200, as power will be 0)
+
+# round_any is from plyr(), don't actually load it because
+# of namespace conflicts with dplyr's 'select'
+# sizes <- seq(from = 1.25, to = 2.01, by = .04)^10 %>% round_any(3)
+
+sizes <- c(10, 20, 30, 40, 50, 70, 90, 120, 150, 190, 
+           240, 300, 400, 500, 600, 720, 900, 1000)
+
+# generate plot data for the private anova--2 groups
+# with a max difference in means of 1 standard deviation
+anova_only_2gp <- power_plot_estimated(Ns = sizes, 
+                                mus = c(.45, .55), 
+                                sigma = .1, 
+                                epsilon = 1, 
+                                Statistic = "absFstat", 
+                                p = NULL, 
+                                reps = 1e3, 
+                                frac = .75)
+
+# save the private ANOVA data
+save(anova_only_2gp, file = "anova/data/anova_only_2gp.Rda")
+
+# generate data for the public, squared (normal) anova
+anova_only_pub_2gp <- power_plot_estimated(Ns = sizes, 
+                                mus = c(.45, .55), 
+                                sigma = .1, 
+                                epsilon = 1, 
+                                Statistic = "Fstat", 
+                                p = NULL, 
+                                reps = 1e3, 
+                                frac = .5)
+
+# save the public ANOVA data
+save(anova_only_pub_2gp, file = "anova/data/anova_only_pub_2gp.Rda")
+
+# convert the plot data to same format as the new test
+plot_df_anova_new_2gp <- anova_only_2gp %>%
+    filter(eps == 1) %>%
+    select(N = N,
+           power_vector = Power) %>%
+    mutate(test_type = "Private ANOVA")
+
+# do the same with the public data
+plot_df_anova_pub_2gp <- anova_only_pub_2gp %>%
+    filter(eps == "None") %>%
+    select(N = N,
+           power_vector = Power) %>%
+    mutate(test_type = "Public ANOVA")
+
+# load and transform the Mann Whitney data
+load("mw/data/mw_no_ties.Rda")
+
+mann_whitney_data <- mw_no_ties %>%
+  filter(epsilon == "1" | epsilon == "Public") %>%
+  filter(sizes < 1077) %>%
+  mutate(test_type = case_when(
+    epsilon == "1" ~ "Private MW",
+    epsilon == "Public" ~ "Public MW"
+  )) %>%
+  select(N = sizes,
+         power_vector = power,
+         test_type)
+
+# put together a plotting dataframe of all of the tests
+mw_vs_anova <- rbind(plot_df_anova_new_2gp,
+                       plot_df_anova_pub_2gp,
+                       mann_whitney_data)
+
+# save the final plot data
+save(mw_vs_anova, file = "anova/data/mw_vs_anova.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# plot the data
+mw_vs_anova_plot <- ggplot(mw_vs_anova) +
+    geom_line(aes(x = N, 
+                  y = power_vector, 
+                  col = factor(test_type, levels = c('Public MW', 'Public ANOVA', 'Private MW', 'Private ANOVA'))),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", 
+         col = "Test", 
+         y = "Power") +
+    scale_x_log10() +
+    theme_minimal(base_size = 24,
+                  base_family = "Times") + 
+    scale_color_manual(values = colors[c(4, 3, 2, 1)],
+                       labels = c("MW", "ANOVA", unname(TeX("\\widetilde{MW}")), "Swanberg")) +
+    theme(axis.line = element_line(colour = "black"))
+
+mw_vs_anova_plot    
+    
+# save the plot
+ggsave(filename = "mw_vs_anova.png", 
+       plot = mw_vs_anova_plot,
+       path = "figures",
+       width = 10,
+       height = 5.5,
+       units = "in")
+```
+
+We would also like to compare to the ANOVA test at different effect sizes and epsilons. The following few chunks will follow nearly identically for the two above.
+
+```{r 3gp small eps}
+# choose sample sizes s.t. values are evenly spaced when plotted on
+# a log 10 scale (except for N < 200, as power will be 0)
+
+# round_any is from plyr(), don't actually load it because
+# of namespace conflicts with dplyr's 'select'
+#sizes <- seq(from = 1.25, to = 2.30, by = .04)^10 %>% round_any(3)
+
+# We'll need to use a bit bigger sample sizes here
+sizes <- c(9, 12, 18, 24, 30, 42, 54, 69, 90, 117, 150, 189, 
+           240, 303, 378, 471, 582, 717, 879, 1077, 1311,
+           1590, 1923, 2316, 2778, 3324, 3966)
+
+# generate plot data for the private anova
+# make the effect size smaller-1/3 of a sd
+anova_only_small_effect <- power_plot_estimated(Ns = sizes[seq(1, length(sizes), 2)], 
+                                mus = c(.47, .5, .53), 
+                                sigma = .18, 
+                                epsilon = 1, 
+                                Statistic = "absFstat", 
+                                p = NULL, 
+                                reps = 1e3, 
+                                frac = .75)
+
+# save the private ANOVA data
+save(anova_only_small_effect, file = "anova/data/anova_only_small_effect.Rda")
+
+# convert the plot data to same format as the new test
+plot_df_anova_new <- anova_only_small_effect %>%
+    filter(eps == 1) %>%
+    select(N = N,
+           power_vector = Power) %>%
+    mutate(test_type = "Private ANOVA")
+
+
+# load and transform the Kruskal Wallis data
+load("kw/data/kw_small_effect.Rda")
+
+plot_df_new <- kw_small_effect %>%
+  filter(epsilon == 1 & kw_version == "abs" & N < 4000) %>%
+  select(N, power_vector) %>%
+  mutate(test_type = "New KW")
+
+plot_df_pub <- kw_small_effect %>%
+  filter(epsilon == "Public" & kw_version == "sq" & N < 4000) %>%
+  select(N, power_vector) %>%
+  mutate(test_type = "Public KW")
+
+# put together a plotting dataframe of all of the tests
+kw_vs_anova_small_eff <- rbind(plot_df_anova_new,
+                       plot_df_new,
+                       plot_df_pub)
+
+# save the final plot data
+save(kw_vs_anova_small_eff, file = "anova/data/kw_vs_anova_small_eff.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# plot the data
+kw_vs_anova_small_eff_plot <- ggplot(kw_vs_anova_small_eff) +
+    geom_line(aes(x = N, 
+                  y = power_vector, 
+                  col = as.factor(test_type)),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", 
+         col = "Test Type", 
+         y = "Power") +
+    scale_x_log10() +
+    theme_minimal(base_size = 24,
+                  base_family = "Times") + 
+    scale_color_manual(values = colors[c(2, 1, 4)], labels = c(unname(TeX(c("$\\widetilde{H}_{abs}$",
+                                  "$\\widetilde{F}_{abs}$"))), 
+                                  "Public H")) +
+    theme(axis.line = element_line(colour = "black"))
+
+kw_vs_anova_small_eff_plot    
+    
+# save the plot
+ggsave(filename = "kw_vs_anova_small_eff.png", 
+       plot = kw_vs_anova_small_eff_plot,
+       path = "figures",
+       width = 10,
+       height = 7,
+       units = "in")
+```
+
+We do the same thing for extremely large effect sizes, which is where ANOVA could beat Kruskal-Wallis.
+
+```{r 3gp big effect}
+# We'll need to use a bit bigger sample sizes here
+sizes <- c(9, 12, 18, 24, 30, 42, 54, 69, 90, 117, 150, 189, 
+           240, 303, 378, 471, 582, 717, 879, 1077, 1311,
+           1590, 1923, 2316, 2778, 3324, 3966)
+
+# generate plot data for the private anova
+# make the effect size smaller-1/3 of a sd
+anova_only_big_eff <- power_plot_estimated(Ns = sizes[seq(1, length(sizes), 2)], 
+                                mus = c(.45, .5, .55), 
+                                sigma = .01, 
+                                epsilon = .1, 
+                                Statistic = "absFstat", 
+                                p = NULL, 
+                                reps = 1e3, 
+                                frac = .75)
+
+# save the private ANOVA data
+save(anova_only_big_eff, file = "anova/data/anova_only_big_eff.Rda")
+
+# convert the plot data to same format as the new test
+plot_df_anova_new <- anova_only_big_eff %>%
+    filter(eps == .1) %>%
+    select(N = N,
+           power_vector = Power) %>%
+    mutate(test_type = "Private ANOVA")
+
+
+# load and transform the Kruskal Wallis data
+load("kw/data/kw_big_effect.Rda")
+
+plot_df_new <- kw_big_effect %>%
+  filter(epsilon == .1 & kw_version == "abs" & N < 4000) %>%
+  select(N, power_vector) %>%
+  mutate(test_type = "New KW")
+
+plot_df_pub <- kw_big_effect %>%
+  filter(epsilon == "Public" & kw_version == "sq" & N < 4000) %>%
+  select(N, power_vector) %>%
+  mutate(test_type = "Public KW")
+
+# put together a plotting dataframe of all of the tests
+kw_vs_anova_big_eff <- rbind(plot_df_anova_new,
+                       plot_df_new,
+                       plot_df_pub)
+
+# save the final plot data
+save(kw_vs_anova_big_eff, file = "anova/data/kw_vs_anova_big_eff.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# plot the data
+kw_vs_anova_big_eff_plot <- ggplot(kw_vs_anova_big_eff) +
+    geom_line(aes(x = N, 
+                  y = power_vector, 
+                  col = as.factor(test_type)),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", 
+         col = "Test Type", 
+         y = "Power") +
+    scale_x_log10() +
+    theme_minimal(base_size = 24,
+                  base_family = "Times") + 
+    scale_color_manual(values = colors[c(2, 1, 4)], labels = c(unname(TeX(c("$\\widetilde{H}_{abs}$",
+                                  "$\\widetilde{F}_{abs}$"))), 
+                                  "Public H")) +
+    theme(axis.line = element_line(colour = "black"))
+
+kw_vs_anova_big_eff_plot    
+    
+# save the plot
+ggsave(filename = "kw_vs_anova_big_eff.png", 
+       plot = kw_vs_anova_big_eff_plot,
+       path = "figures",
+       width = 10,
+       height = 7,
+       units = "in")
+```

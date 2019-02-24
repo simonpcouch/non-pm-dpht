@@ -1,0 +1,223 @@
+---
+output: github_document
+---
+# Noncomparative Power Analysis
+#### *The Effect of Ties and Tiebreaking on Power*
+
+This file analyzes the power of our DP Wilcoxon Signed-Rank test in the setting where sample data comes from a discrete distribution.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE)
+```
+
+```{r packages}
+library(plyr)
+library(rmutil)
+library(tidyverse)
+library(latex2exp)
+```
+
+We define a set of functions to functionalize the power analysis process, eventually coming together in a `pwr_plot` function that simulates data, calculates test statistics, finds power, and plots an informative graph based on user arguments.
+
+#### Loading Functions
+
+Some functions used throughout this repo are universal to most of the files. We load them now. Refer to the relevant files in the `fxns` folder for documentation.
+
+```{r fxns}
+source('wc/fxns/wc_new.R')
+source('wc/fxns/gen_null.R')
+```
+
+`gen_data` is a function that generates difference sets and noise with given parameters. Note that this is a different `gen_data` than used throughout the rest of the `wc` repo. The arguments of `gen_data` are as follows:
+
+* `n`: a numeric of desired difference set size
+* `prop_0`: a numeric of the proportion of the difference set to round to 0
+* `mean`: a vector (length 2) of means to draw random samples with--supplying identical means and standard deviations generates a null distribution of test statistics
+* `sd`: a vector (length 2) of standard deviations to draw random samples with--supplying identical means and standard devations generates a null distribution of test statistics
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+* `epsilon`: NA or a numeric--the epsilon to carry the test out with--NA indicates a public test
+
+The function outputs a dataframe of distributions of difference sets.
+
+```{r gen_data}
+gen_data <- function(n, prop_0, mean, sd, reps, epsilon) {
+  
+  if (is.na(epsilon)) { # carry out the public version
+    
+    vals <- data_frame(x1 = rnorm(n = round(reps*n*(1-prop_0)), 
+                                  mean = mean[1],
+                                  sd = sd[1]),
+               x2 = rnorm(n = round(reps*n*(1-prop_0)), 
+                          mean = mean[2],
+                          sd = sd[2]),
+               x = (x1 - x2),
+               replicate = as.factor(rep(1:reps, 
+                                         each = round(n*(1-prop_0))))) %>%
+          select(x, replicate)
+    
+    zeroes <- data_frame(x = rep(0, 
+                                 times = round(reps*n*prop_0)),
+                         replicate = rep(1:reps, 
+                                         each = round(n*(prop_0))))           
+    
+    rbind(vals, zeroes)
+    
+  } else { # carry out the private version
+    
+    task_s <- 2*(n*.3)/(sqrt((n*.3)*((n*.3)+1)*(2*(n*.3)+1)/6)*(epsilon)) 
+    
+    vals <- data_frame(x1 = rnorm(n = round(reps*(1-prop_0)*n), 
+                                  mean = mean[1],
+                                  sd = sd[1]),
+                       x2 = rnorm(n = round(reps*n*(1-prop_0)), 
+                                 mean = mean[2],
+                                 sd = sd[2]),
+                       x = x1 - x2,
+                       replicate = rep(1:reps, 
+                                       each = round(n*(1-prop_0))),
+                       noise = rep(rlaplace(n = reps,
+                                            m = 0,
+                                            s = n*2/epsilon), 
+                                    each = round(n*(1-prop_0)))) %>%
+          select(x, replicate, noise)
+     
+    zeroes <- data_frame(x = rep(0, round(reps*n*prop_0)),
+                         replicate = as.factor(rep(1:reps, 
+                                                   each = round(n*(prop_0)))),
+                         noise = rep(Inf, 
+                                     times = round(reps*n*prop_0)))
+    
+    rbind(vals, zeroes)
+  }
+}
+```
+
+`calc_stat` is a function that takes in a dataframe outputted by `gen_data` and outputs a vector of test statistics with length `reps`. The function simply detects whether the supplied dataframe was generated for a private or public test, and then groups the difference sets together and supplies them to `wc_new`.
+
+```{r calc_stat}
+calc_stat <- function(df) {
+    if ("noise" %in% colnames(df)) { # carry out the private version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc_new(x) + noise[1]) %>%
+    dplyr::select(stat) %>%
+    pull()
+  } else { # carry out the public version
+  df %>% 
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc_new(x)) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  }
+}
+```
+
+The `pwr_plot` function is a wrapper for each of the functions defined above. It maps the functions over user arguments and returns a dataframe that can be plotted to make a power plot. The arguments are as follows:
+
+* `sizes`: a list of numerics indicating the sample sizes to run the test on
+* `epsilons`: a list of numerics indicating the privacy parameters to the run the test on, where NA indicates the public test
+* `prop_0`: the proportion of zeroes to introduce into the data
+* arguments beginning with `mean` and `sd` are vectors of length 2 indicating the parameters to generate the *u* and *v* sets with. 
+* `reps`: the number of simulations to carry the test out with
+
+```{r pwr_plot}
+pwr_plot <- function(sizes, epsilons, prop_0, mean_null, sd_null, mean_alt, sd_alt, reps) {
+ 
+# generate a distribution of null test statistics at each sample size and
+# epsilon combination 
+  null_stats <- map2_dfc(.x = rep(unlist(sizes), times = length(epsilons)),
+                    .y = rep(unlist(epsilons), each = length(sizes)),
+                    .f = gen_null,
+                    reps = reps)
+  
+# find two-sided critical values
+  crit_vals  <-  map(.x = abs(null_stats), 
+                     .f = quantile, 
+                     probs = (1 - .05), 
+                     na.rm = TRUE) %>% 
+                 unlist(use.names = FALSE)
+  
+
+# simulate alternate distributions of difference sets at varying sample 
+# size and epsilon combinations, and then calculate test statistics 
+# from the distributions. the output, alt_stats, is a dataframe, where each 
+# row is a distinct combination of epsilons & sample size, with nrow = reps
+    
+  alt_data <-   map2(.x = rep(unlist(sizes), times = length(epsilons)), 
+                     .y = rep(unlist(epsilons), each = length(sizes)), 
+                     .f = gen_data, 
+                     mean = mean_alt, 
+                     sd = sd_alt, 
+                     reps = reps, 
+                     prop_0 = prop_0)
+
+  alt_stats <-  map_dfc(.x = alt_data, 
+                        .f = calc_stat)
+  
+# calculate power of the tests 
+  power_vector <- map2(.x = crit_vals, 
+                       .y = abs(alt_stats), 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+  
+# convert NA epsilons to "Public" for plotting  
+  epsilons[is.na(epsilons)] <- "Public"
+  
+# make a dataframe of arguments and resultant powers  
+  plot_df <- data.frame(sizes = rep(sizes, times = length(epsilons)),
+                        epsilons = rep(unlist(epsilons), each = length(sizes)),
+                        power = power_vector)
+  
+  plot_df
+}
+```
+
+#### Generating the Plot
+
+The following function call generates the plot to be used in the paper.
+
+```{r plot}
+# create a greyscale-friendly, qualitative color scheme
+colors <- c("#05e200", "#000099", "#dd02e0", "#ece900")
+
+# generate the plot data
+wc_30pct_ties <- pwr_plot(sizes = seq(from = 1.45, 
+                                       to = 2.45, 
+                                       by = (.05))^10 %>% round_any(., 30) %>% c(10, .),
+         epsilons = list(.01, .1, 1, NA),
+         prop_0 = .3,
+         mean_null = c(0, 0),
+         sd_null = c(1, 1),
+         mean_alt = c(0, 1),
+         sd_alt = c(1, 1),
+         reps = 1e6)
+
+# save the plot data
+save(wc_30pct_ties, file = "wc/data/wc_30pct_ties.Rda")
+
+# plot the data  
+wc_30_pct_ties_plot <- ggplot(wc_30pct_ties) + 
+        geom_line(aes(x = sizes, 
+                      y = power, 
+                      linetype = as.factor(epsilons),
+                      col = as.factor(epsilons)),
+                  size = 1.3) +
+        labs(x = expression("Database Size"~italic("n")), y = "Power") +
+        scale_color_manual(name = TeX('$\\epsilon$'),
+                           values = colors) +
+        scale_x_log10() +
+        scale_linetype_manual(name = TeX('$\\epsilon$'),
+                              values = c(4, 2, 3, 1)) +
+        theme_minimal(base_family = "Times", base_size = 24) +
+        theme(axis.line = element_line(colour = "black"))
+
+# save the plot
+ggsave(filename = "wc_30_pct_ties.png", 
+       plot = wc_30_pct_ties_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```

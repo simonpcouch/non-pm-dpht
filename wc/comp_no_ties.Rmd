@@ -1,0 +1,404 @@
+---
+output: github_document
+---
+# Wilcoxon Signed-Rank Power Analysis
+#### *Comparative Analysis Assuming No Ties*
+
+This file analyzes the power of our DP Wilcoxon Signed-Rank test in comparison to Task 2016's tests in the setting where sample data comes from a continuous distribution.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+```
+
+We define a set of functions to functionalize the power analysis process, eventually coming together in a `pwr_plot` function that simulates data, calculates test statistics, finds power, and plots an informative graph based on user arguments.
+
+Some functions used throughout this repo are universal to most of the files. We load them now. Refer to the relevant files in the `fxns` folder for documentation.
+
+```{r fxns}
+source('wc/fxns/wc.R')
+source('wc/fxns/wc_new.R')
+source('wc/fxns/gen_null.R')
+source('wc/fxns/calc_task_crit_val.R')
+```
+
+`gen_data` is a function that generates difference sets and noise with given parameters. The arguments of `gen_data` are as follows:
+
+* `n`: a numeric of desired difference set size
+* `epsilon`: NA or a numeric--the epsilon to carry the test out with--NA indicates a public test
+* `mean`: a vector (length 2) of means to draw random samples with--supplying identical means and standard deviations is one way of generating a null distribution of test statistics
+* `sd`: a vector(length 2) of standard deviations to draw random samples with--supplying identical means and standard devations is one way of generating a null distribution of test statistics
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+
+The function outputs a dataframe of distributions of difference sets.
+
+```{r gen_data}
+gen_data <- function(n, epsilon = NA, mean, sd, reps, k) {
+  if (is.na(epsilon)) { # carry out the public version
+    data_frame(x1 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[1], n), reps),
+                       sd = rep(rep(sd[1], n), reps)),
+               x2 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[2], n), reps),
+                       sd = rep(rep(sd[2], n), reps)),
+               x = x1 - x2,
+               replicate = as.factor(rep(1:reps, each = n))) %>%
+      select(x, replicate)
+  } else { # carry out the private version
+    delta_f <- n*2
+    data_frame(x1 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[1], n), reps),
+                       sd = rep(rep(sd[1], n), reps)),
+               x2 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[2], n), reps),
+                       sd = rep(rep(sd[2], n), reps)),
+               x = x1 - x2,
+               replicate = as.factor(rep(1:reps, each = n)),
+               noise = rep(rlaplace(n = reps,
+                       m = 0,
+                       s = delta_f/epsilon), each = n),
+               noise_task_priv = rep(rlaplace(n = reps,
+                                         m = 0,
+  # abuse indentation for 80 char limit                                                
+  s = 4*k/(sqrt(2*k*(2*k+1)*(4*k+1)/6)*epsilon)), 
+                                 each = n),
+               noise_task_util = rep(rlaplace(n = reps,
+                                         m = 0,
+  # abuse indentation for 80 char limit                                                
+  s = 2*(n*.3)/(sqrt((n*.3)*((n*.3)+1)*(2*(n*.3)+1)/6)*epsilon)), 
+                                 each = n)) %>%
+    select(x, replicate, noise, noise_task_priv, noise_task_util)
+  }
+}
+```
+
+Task 2016 details a "priming" procedure to ensure a known, minimum value of `n`. `prime_data` carries out this procedure. The function takes a  dataframe outputted by `gen_data` and outputs a similar dataframe.
+
+```{r prime_data}
+prime_data <- function(df, k) {
+      reps <- n_distinct(df$replicate)
+      n <- nrow(df)/reps
+      prime <- data_frame(x = rep(c(rep(max(abs(df$x) + 1), k), 
+                                    rep(-max(abs(df$x) - 1), k)), 
+                                  reps),
+                          replicate = rep(1:reps, each = 2*k),
+                          noise = rep(Inf, 2*k*reps),
+                          noise_task_priv = rep(Inf, 2*k*reps),
+                          noise_task_util = rep(Inf, 2*k*reps))
+      rbind(df, prime)
+} 
+```
+
+`calc_stat` is a function that takes in a dataframe outputted by `gen_data` and outputs a vector of test statistics with length `reps`. The function simply detects whether the supplied dataframe was generated for a private or public test, and then groups the difference sets together and supplies them to `wc_new`.
+
+```{r calc_stat}
+calc_stat <- function(df, type) {
+    if (type == "priv") { # carry out the high privacy version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(., stat = (wc(x)/sqrt(length(x)*(length(x) + 1)*(2*length(x) + 1)/6) + noise_task_priv[1])) %>% 
+    dplyr::select(stat) %>%
+    pull()
+    
+  } else if (type == "util") { # carry out the high utility version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(., stat = (wc(x)/sqrt(length(x)*(length(x) + 1)*(2*length(x) + 1)/6) + noise_task_util[1])) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  } else if (type == "public") { # carry out the public version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(., stat = (wc(x)/sqrt(length(x)*(length(x) + 1)*(2*length(x) + 1)/6))) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  }
+}
+
+calc_stat_new <- function(df) {
+    if ("noise" %in% colnames(df)) { # carry out the private version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc_new(x) + noise[1]) %>%
+    dplyr::select(stat) %>%
+    pull()
+  } else { # carry out the public version
+  df %>% 
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc_new(x)) %>%
+    dplyr::select(stat) %>%
+    pull()
+  }
+}
+```
+
+`pwr_plot` is a wrapper function for each of the functions defined above. The arguments of the function are as follows:
+* `sizes`: a list of numerics
+* `epsilon`: a numeric (currently only supports `epsilon = 1`)
+* arguments beginning with `mean` or `sd` are vectors of length 2--the first two (in position) are the arguments to generate the null distribution, and the second two are to generate the alternate distribution
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+* `alpha`: a two-sided significance value
+* `k`: a priming value for the Task 2016 test
+
+```{r pwr_plot}
+pwr_plot <- function(sizes, epsilon, mean_null, sd_null, mean_alt, sd_alt, reps, alpha, k) {
+     
+# simulate null distributions at varying sample sizes
+  
+  null_data <-     map(.x = sizes, 
+                       .f = gen_data, 
+                       epsilon = epsilon, 
+                       mean = mean_null, 
+                       sd = sd_null, 
+                       reps = reps,
+                       k = k)
+
+# Find Power of the New Test -------------------------------------------  
+  
+# simulate test statistics for the new test   
+  null_stats_new <- map_dfc(.x = sizes, 
+                            .f = gen_null,
+                            epsilon = epsilon,
+                            reps = reps) %>%
+                    abs()
+
+# calculate critical values for the new test for each sample size
+  
+  crit_vals_new  <-   map(null_stats_new, 
+                          quantile, 
+                          probs = (1 - alpha)) %>% 
+                      unlist(use.names = FALSE)
+  
+# simulate alternate distributions at varying sample sizes, and then
+# calculate test statistics from the null distributions. the output, 
+# alt_stats_new, is a dataframe, where each row is a distribution of 
+# test statistics for a given sample size, with nrow = reps
+  
+  alt_data <-     map(.x = sizes, 
+                      .f = gen_data, 
+                      epsilon = epsilon,
+                      mean = mean_alt, 
+                      sd = sd_alt, 
+                      reps = reps,
+                      k = 15) 
+  
+  alt_stats_new <- map_dfc(.x = alt_data, 
+                           .f = calc_stat_new) %>%
+                  abs()
+  
+# this is a vector of powers at given epsilon and sample size combinations 
+   
+  power_vector_new <- map2(.x = crit_vals_new, 
+                       .y = alt_stats_new, 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+  
+# Find Power of the Public Test ----------------------------------------
+  
+# simulate null distributions at varying sample sizes, and then
+# calculate test statistics from the null distributions. the output, null_stats_public, is a 
+# dataframe, where each row is a distribution at a given sample size, with nrow = reps
+  
+  null_data_public <- map(.x = sizes, 
+                          .f = gen_data, 
+                          epsilon = NA, 
+                          mean = mean_null, 
+                          sd = sd_null, 
+                          reps = reps,
+                          k = k)
+  
+  null_stats_public <- map_dfc(.x = null_data_public, 
+                               .f = calc_stat,
+                               type = "public") %>%
+                        abs()
+
+# calculate critical values for the public test for each sample size
+  
+  crit_vals_public  <-   map(null_stats_public, 
+                             quantile, 
+                             probs = (1 - alpha)) %>% 
+                         unlist(use.names = FALSE)
+  
+# simulate public alternate distributions at varying sample sizes 
+  alt_data_public  <- map(.x = sizes, 
+                          .f = gen_data, 
+                          epsilon = NA,
+                          mean = mean_alt, 
+                          sd = sd_alt, 
+                          reps = reps,
+                          k = k)
+  
+# calculate test statistics from the null distributions. the output, 
+# alt_stats_public, is a dataframe, where each row is a distribution 
+# of test statistics for a given sample size, with nrow = reps
+  
+  alt_stats_public <- map_dfc(.x = alt_data_public, 
+                              .f = calc_stat,
+                              type = "public") %>%
+                      abs()
+  
+# this is a vector of powers at given epsilon and sample size combinations 
+   
+  power_vector_public <- map2(.x = crit_vals_public, 
+                       .y = alt_stats_public, 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+
+# Find the Power of the High Privacy and High Utility algorithms ------------------
+   
+# prime alt_data with 2*k values  
+  alt_data_primed <- map(alt_data, prime_data, k = k)
+  
+# generate an alternate distribution of test statistics for the high privacy test
+  alt_stats_task_priv <- map_dfc(.x = alt_data_primed, 
+                           .f = calc_stat,
+                           type = "priv") %>%
+                        abs()
+  
+# calculate crit vals of tasks high privacy test
+  crit_vals_task_priv <- calc_task_crit_val(n = 2*k,
+                                       alpha = alpha,
+                                       epsilon = epsilon) %>%
+                    rep(., length(sizes))
+ 
+# find power   
+  power_vector_task_priv <- map2(.x = crit_vals_task_priv, 
+                       .y = alt_stats_task_priv, 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE) 
+
+# generate an alternate distribution of test statistics for the high utility test
+  alt_stats_util <- map_dfc(.x = alt_data, 
+                           .f = calc_stat,
+                           type = "util")  %>%
+                    abs()
+  
+# calculate crit vals of tasks high utility test 
+ crit_vals_task_util <- map(unlist(sizes)*.3,
+                            calc_task_crit_val,
+                            alpha = alpha,
+                            epsilon = epsilon) %>%
+                        unlist()
+# find power
+ power_vector_task_util <- map2(.x = crit_vals_task_util, 
+                                .y = alt_stats_util, 
+                                .f = function(x, y) {mean(y > x)}) %>% 
+                                unlist(use.names = FALSE)  
+
+# Combine the Data -------------------------------------
+    
+# create a dataframe of arguments and resultant powers 
+  plot_df <- data.frame(power = c(power_vector_task_priv,
+                                  power_vector_task_util,
+                                  power_vector_new,
+                                  power_vector_public),
+                        sizes = rep(unlist(sizes), 4),
+                        type = rep(c("High Privacy",
+                                     "High Utility",
+                                     "New",
+                                     "Public"), 
+                                   each = length(sizes)))
+
+  plot_df
+}
+```
+
+The following function calls generate plots to be used in the paper.
+
+```{r plot}
+# create a greyscale-friendly, qualitative color scheme
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# generate a list of sample sizes
+sizes <- c(5, seq(from = 10, to = 200, by = 10))
+
+# generate the plot data
+wc_vs_task_no_ties <- pwr_plot(sizes = sizes, 
+         epsilon = 1,
+         mean_null = c(0, 0), 
+         sd_null = c(1, 1), 
+         mean_alt = c(1, 0), 
+         sd_alt = c(1, 1),
+         reps = 1e6, 
+         alpha = .05,
+         k = 15)
+
+# save the plot data
+save(wc_vs_task_no_ties, file = "wc/data/wc_vs_task_no_ties.Rda")
+
+# plot the data
+wc_vs_task_no_ties_plot <- ggplot(wc_vs_task_no_ties) +
+             geom_line(aes(x = sizes, 
+                           y = power, 
+                           linetype = as.factor(type), 
+                           col = as.factor(type)),
+                       size = 1.3) +
+             labs(x = expression("Database Size"~italic("n")), 
+                  y = "Power") +
+             theme_minimal(base_family = "Times", base_size = 24) +
+             scale_linetype_manual(values = c("longdash", "dashed", "dotted",  "solid"),
+                                   name = "Test Type") +
+             scale_color_manual(name = "Test Type", 
+                                values = colors) +
+             theme(axis.line = element_line(colour = "black"))
+
+wc_vs_task_no_ties_plot
+
+# save the plot
+ggsave(filename = "wc_vs_task_no_ties.png", 
+       plot = wc_vs_task_no_ties_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+
+# generate another list of sample sizes
+sizes2 <- c(5, 10, 13, 16, 20, 35, 50, 100, 250, seq(from = 500, to = 5000, by = 500))
+
+# generate new data with an epsilon of .1
+wc_vs_task_no_ties_low_eps <- pwr_plot(sizes = sizes2, 
+         epsilon = .1,
+         mean_null = c(0, 0), 
+         sd_null = c(1, 1), 
+         mean_alt = c(1, 0), 
+         sd_alt = c(1, 1),
+         reps = 1e6, 
+         alpha = .05,
+         k = 15)
+
+# save the plot data
+save(wc_vs_task_no_ties_low_eps, file = "wc/data/wc_vs_task_no_ties_low_eps.Rda")
+
+# plot the data
+wc_vs_task_no_ties_low_eps_plot <- ggplot(wc_vs_task_no_ties_low_eps) +
+             geom_line(aes(x = sizes, 
+                           y = power, 
+                           linetype = as.factor(type), 
+                           col = as.factor(type)),
+                       size = 1.3) +
+             labs(x = expression("Database Size"~italic("n")), 
+                  y = "Power") +
+             theme_minimal(base_family = "Times", base_size = 24) +
+             scale_linetype_manual(values = c("longdash", "dashed", "dotted",  "solid"),
+                                   name = "Test Type") +
+             scale_color_manual(name = "Test Type", 
+                                values = colors) +
+             theme(axis.line = element_line(colour = "black"))
+
+wc_vs_task_no_ties_low_eps_plot
+
+# save the plot
+ggsave(filename = "wc_vs_task_no_ties_low_eps.png", 
+       plot = wc_vs_task_no_ties_low_eps_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+

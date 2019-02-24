@@ -1,0 +1,235 @@
+---
+output: github_document
+---
+# Mann-Whitney Power Analysis
+#### *Real World Application—Nepal Abortion Data*
+
+This file serves to demonstrate the ability of our test to pick up effects from real world data. This dataset, from ICPSR, contains individual-level data on abortions in Nepal. We want to make clear that we make no attempts to de-anonymize this data, as required by the conditions set by ICPSR for the release of the data.
+
+```{r packages}
+library(tidyverse)
+library(haven)
+library(rmutil)
+library(latex2exp)
+```
+
+We first load in the dataset from the provided .dta (STATA) file.
+
+```{r import}
+raw_data <- read_dta("mw/data/Cleaned-Client-Dataset_ICPSR.dta")
+```
+
+We now select the columns for the last menstrual period of the patient and whether or not a medical abortion was granted, as well as some basic tidying. Note that we filter out observation where the last period is over 900 days ago; with the exception of a few values of 996 and 997, all numbers in this column were less than 215. Thus, we suspect this number of an indicator of some condition rather than an actual estimate.
+
+```{r tidy}
+tidy_data <- raw_data %>%
+    select(last_period = 16, 
+           ma_elig = 59) %>%
+    na.omit() %>%
+    filter(last_period < 900)
+```
+
+One would suspect that medical abortions are granted less often for pregancies in later stages.
+
+```{r summarize}
+tidy_data %>%
+  group_by(ma_elig) %>%
+  summarize(n = n(),
+            mean_last_period = mean(last_period))
+
+sd(tidy_data$last_period)
+
+tidy_data %>% 
+  filter(last_period < 150) %>% 
+  ggplot(.) + 
+  geom_line(aes(x = as.numeric(last_period), 
+                     col = as.factor(ma_elig)),
+                 stat = "count",
+                 position = "identity",
+            size = 1) + 
+  theme_minimal() + 
+  labs(x = "Days Since Last Period",
+       y = "Count",
+       color = "Medical \nAbortion \nGranted")
+```
+
+We have 472 cases where medical abortions were *not* granted (with an average number of days since last period of around 72), and 2620 cases where medical abortions *were* granted (with an average number of days since last period of around 49). We see that the difference in means of the two groups is by about 1.5 standard deviations.
+
+We now load the functions used to carry out our test.
+
+```{r source}
+source('mw/fxns/mw.R')
+source('mw/fxns/gen_n.R')
+source('mw/fxns/gen_data.R')
+source('mw/fxns/calc_stat.R')
+```
+
+We select subsamples of the groups s.t. we have equal group sizes and total sample sizes of 100, 250, and 800, using the sample_data function. This function is *not* generalized for any dataframe; it always uses `tidy_data`. The arguments are as follows.
+
+* `n`: a vector of 2 indicating the sample sizes for not accepted and accepted applicants, respectively.
+* `reps`: a numeric indicating how many samples to take
+* `epsilon`: a vector of 2, indicating the privacy parameter to calibrate the noise to. The first element is the portion of epsilon dedicated to estimating the sample size, and the second is to estimating the test statistic.
+* `alpha`: a numeric indicating the significance level to carry the test out with
+
+```{r}
+pwr_plot <- function(n, epsilon, reps, alpha) {
+  
+  # generate privatized n vectors
+  new_n <- map2(.x = rep(n, times = length(epsilon)),
+                .y = rep(epsilon, each = length(n)),
+                .f = gen_n,
+                delta = 1e-6)
+  
+  # find critical value
+  null_args_list <- list(n =        new_n,
+                         new_n =    new_n,
+                         epsilons = rep(epsilon, each = length(n)))
+  
+  crit_vals <- pmap(.l = null_args_list,
+                    .f = gen_data,
+                    mean = c(0, 0),
+                    sd = c(1, 1),
+                    reps = reps) %>%
+               map_dfc(., calc_stat) %>%
+               map(., quantile, probs = alpha) %>%
+               unlist()
+
+
+  # we now define a function that puts together a
+  # dataframe of values samples from tidy_data. these
+  # dataframes are analogous to those outputted by gen_data
+  
+  sample_ma_data <- function(n, new_n, epsilon, reps) {
+  
+    # find the sensitivity for the noise addition
+    delta_f <- max(new_n[1], new_n[2])
+  
+    # filter for uneligible applications
+    df_1 <- filter(tidy_data, ma_elig == 0) %>%
+            select(last_period)
+  
+    # filter for eligible applications
+    df_2 <- filter(tidy_data, ma_elig == 1) %>%
+          select(last_period)
+    
+    
+  if (is.na(epsilon[1])) {
+    # make a dataframe of time since last period
+    n_1 <- data.frame(x = sample_n(df_1, 
+                                   n[1]*reps, 
+                                   replace = TRUE),
+                      group = 0,
+                      replicate = rep(1:reps, each = n[1]))
+  
+    # make a dataframe of time since last period and eligibility for 
+    # uneligible applicants.
+    n_2 <- data.frame(x = sample_n(df_2, 
+                                   n[2]*reps, 
+                                   replace = TRUE),
+                      group = 1,
+                      replicate = rep(1:reps, each = n[2]))
+  
+    df <- rbind(n_1, n_2)
+    names(df) <- c("x", "group", "replicate")
+    
+    df
+  } else {
+    # make a dataframe of time since last period and eligibility
+    n_1 <- data.frame(x = sample_n(df_1, 
+                                   n[1]*reps, 
+                                   replace = TRUE),
+                      group = 0,
+                      replicate = rep(1:reps, each = n[1]),
+                      noise = rep(rlaplace(n = reps,
+                                           m = 0,
+                                           s = delta_f/epsilon[2]),
+                                  each = n[1]))
+  
+  
+    # make a dataframe of time since last period and eligibility for 
+    # uneligible applicants. note that noise is infinity in this
+    # dataframe, as we only need 1 noise value per mw trial
+    n_2 <- data.frame(x = sample_n(df_2, 
+                                   n[2]*reps, 
+                                   replace = TRUE),
+                      group = 1,
+                      replicate = rep(1:reps, each = n[2]),
+                      noise = Inf)
+  
+    df <- rbind(n_1, n_2)
+    names(df) <- c("x", "group", "replicate", "noise")  
+    
+    df
+  }
+}
+  
+# make a list of arguments for the alternate distribution  
+  alt_args_list <- list(n = rep(n, times = length(epsilon)),
+                        new_n = new_n,
+                        epsilon = rep(epsilon, each = length(n)))
+
+# find power  
+  power    <-  pmap(.l = alt_args_list,
+                    .f = sample_ma_data,
+                    reps = reps) %>%
+               map_dfc(., .f = calc_stat) %>%
+               map2(.,
+                   .y = crit_vals,
+                   .f = function(x, y) {mean(x < y)})
+  
+# find total epsilons and convert NAs to "Public"  
+  new_eps <- lapply(epsilons, sum) %>% unlist()
+  new_eps[is.na(new_eps)] <- "Public"
+  
+  data.frame(epsilon = unlist(rep(new_eps, each = length(n))),
+             sizes = unlist(rep(lapply(n, sum), 
+                               times = length(epsilons))),
+             power = unlist(power, use.names = FALSE))
+}
+```
+
+
+```{r usage}
+# create a grey-scale friendly, qualitative color scheme
+colors <- c("#05e200", "#dd02e0", "#ece900")
+
+# make lists of desired arguments
+# the sizes vector is chosen s.t. points in the x-axis will be
+# evenly distributed when plotted with a log scale
+sizes_1d <- round(seq(from = 1.15, to = 1.85, by = .05)^10)
+sizes <- lapply(1:length(sizes_1d), function(x) {rep(sizes_1d[[x]], 2)})
+epsilons <- list(c(.065, .035), c(.65, .35), c(NA, NA))
+
+# generate the plot data
+mw_application <- pwr_plot(n = sizes,
+                    epsilon = epsilons,
+                    reps = 1e3,
+                    alpha = .05)
+
+# save the plot data
+save(mw_application, file = "mw/data/mw_application.Rda")
+
+# generate the plot
+mw_application_plot <- ggplot(mw_application) +
+                       geom_line(aes(x = sizes, 
+                                     y = power, 
+                                     col = epsilon),
+                                 size = 1.3) +
+                       labs(x = TeX('Total Sample Size $n$'), y = "Power") +
+                       scale_color_manual(name = TeX('$\\epsilon$'),
+                                          values = colors) + 
+                       scale_x_log10() +
+                       theme_minimal(base_family = "Times",
+                                     base_size = 24) + 
+                       theme(axis.line = element_line(colour = "black"))
+  
+mw_application_plot
+
+# save the plot
+ggsave(filename = "mw_application.png", 
+       plot = mw_application_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```

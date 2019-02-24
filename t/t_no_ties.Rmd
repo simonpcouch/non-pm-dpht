@@ -1,0 +1,368 @@
+---
+output: github_document
+---
+
+# T-Test Power Analyses
+#### *Implementing Our T-Test Algorithm*
+
+This file serves to our differentially private t-test algorithm. The resulting dataset can be row binded with those from our Wilcoxon test in order to compare power on identical effects.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+library(latex2exp)
+library(plyr)
+```
+
+The `paired_t` function takes in a difference set and outputs a paired t test statistic at the given epsilon. `x` is a difference set of arbitrary length. `epsilon` is a vector of length 2 where `sum(epsilon)` is the total privacy budget.
+
+```{r paired_t}
+paired_t <- function(x, epsilon_1, epsilon_2) {
+  # refer to the length(x) as n
+  n <- length(x)
+  # truncate the data to a [-1, 1] interval
+  for (i in 1:n) {
+    # round values below -1 to -1
+    if (x[i] < -1) {
+      x[i] <- -1
+    # round values over 1 to 1
+    } else if (x[i] > 1) {
+      x[i] <- 1
+    }
+  }
+  # find the mean of the difference set
+  mean_x <- mean(x)
+  # if epsilon isn't NA, add noise to mean_x.
+  if (!is.na(epsilon_2)) {
+    mean_x <- mean_x + rlaplace(s = (2/n)/epsilon_1)
+  }
+  # find a term analogous to the variance but not scaled to sample size
+  B <- sum((x)*(x-mean(x)))
+  # if epsilon isn't NA, estimate a term analogous to the variance
+  if (!is.na(epsilon_2)) {
+    B <- B + rlaplace(s = 5/epsilon_2)
+  }
+  # if the noise caused the variance to be negative, set the statistic
+  # to 0. otherwise, calculate the test statistic.
+  if (B > 0) {
+    # calculate the  test statistic
+    statistic <- mean_x / sqrt((1/n)*(1/(n-1))*B)
+    # except when the variance is negative due to privacy
+  } else {
+    statistic <- 0
+  }
+  # return the test statistic
+  return(statistic)
+}
+```
+
+`gen_data` is a function that puts together a dataframe of difference sets that can be supplied to `calc_stat` in order to generate a distribution of test statistics.
+
+```{r gen_data}
+# n is the desired difference set size
+# epsilon is a vector with length 2 where sum(epsilon) is 
+#     the total privacy budget
+# mean and sd are the parameter to generate the data with
+# reps is the number of repititions to carry the simulations
+#     out with
+
+gen_data <- function(n, epsilon = c(NA, NA), mean, sd, reps) {
+    data_frame(x = rnorm(n = reps*n, 
+                         mean = rep(rep(mean, n), reps),
+                         sd = rep(rep(sd, n), reps)),
+               replicate = as.factor(rep(1:reps, each = n)),
+               epsilon_1 = rep(epsilon[1], reps*n),
+               epsilon_2 = rep(epsilon[2], reps*n))
+}
+```
+
+`calc_stat` takes in a dataframe outputted by `gen_data` and outputs a distribution of t test statistics.
+
+```{r calc_stat}
+calc_stat <- function(df) {
+    df %>%
+      # group by the replicate column
+      dplyr::group_by(replicate) %>%
+      # run the paired t-test on each difference set
+      dplyr::summarize(stat = paired_t(x, 
+                                       epsilon_1[1], 
+                                       epsilon_2[1])) %>%
+      # release the test statistic
+      dplyr::select(stat) %>%
+      pull()
+}
+```
+
+`pwr_plot` is a wrapper function that vectorizes the functions defined above over several combinations of sample sizes and epsilons. Note that there are other `pwr_plot`s defined throughout this repo, which all treat different inputs as variables and implement different tests.
+
+* `sizes`: A list of numerics indicating the sample size to carry the test out with.  
+* `epsilons`: A list of numeric vectors of length 2 (where c(NA, NA) indicates a public test)  
+* `delta`: A numeric indicating the privacy parameter
+* arguments beginning with `mean` and `sd` indicate the parameters to generate data for the reference and alternate distribution with.  
+* `reps`: A numeric indicating the number of repititions to carry out the simulations with.  
+* `alpha`: A numeric indicating the significance level to carry the test out with.  
+
+```{r pwr_plot}
+pwr_plot <- function(sizes, epsilons, mean_null, sd_null, mean_alt, sd_alt, reps, alpha) {
+   
+# simulate null distributions at varying sample size and epsilon combinations, 
+# and then calculate test statistics from the null distributions. the output, 
+# null_stats, is a dataframe, where each column is a distinct combination of 
+# epsilons & sample size and each row is one simulation, with nrow = reps
+  
+  null_stats <-   map2(.x = rep(sizes, each = length(epsilons)), 
+                       .y = rep(epsilons, times = length(sizes)), 
+                       .f = gen_data, 
+                       mean = mean_null,
+                       sd = sd_null,
+                       reps = reps) %>%
+                  map_dfc(.x = ., .f = calc_stat) %>%
+                  abs()
+
+# calculate critical values for each combination of epsilon and sample size
+  
+  crit_vals  <-   map(null_stats, 
+                      quantile, 
+                      probs = 1 - alpha) %>% 
+                  unlist(use.names = FALSE)
+  
+# simulate alternate distributions of difference sets at varying sample 
+# size and epsilon combinations, and then calculate test statistics 
+# from the distributions. the output, alt_stats, is a dataframe, where each 
+# row is a distinct combination of epsilons & sample size, with nrow = reps
+  
+  alt_stats <-   map2(.x = rep(sizes, each = length(epsilons)), 
+                      .y = rep(epsilons, times = length(sizes)), 
+                      .f = gen_data, 
+                      mean = mean_alt,
+                      sd = sd_alt,
+                      reps = reps) %>%
+                  map_dfc(.x = ., .f = calc_stat) %>%
+                  abs()
+  
+# this is a vector of powers at given epsilon and sample size combinations 
+   
+  power_vector <- map2(.x = crit_vals, 
+                       .y = alt_stats, 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+    
+# create a dataframe of arguments and resultant powers, plot it  
+# double the sizes to reflect that the differences come from 2 samples each
+  plot_df <- data_frame(epsilon_1 = rep(unlist(map(.x = 1:length(epsilons), 
+                                                   .f = function(i, vector) {vector[[i]][1]}, 
+                                                   epsilons)),
+                                        length(sizes)),
+                        epsilon_2 = rep(unlist(map(.x = 1:length(epsilons), 
+                                                   .f = function(i, vector) {vector[[i]][2]}, 
+                                                   epsilons)),
+                                        length(sizes)),
+                        sizes = (unlist(rep(sizes, each = length(epsilons)))),
+                        power = power_vector) %>%
+            mutate(epsilon = epsilon_1 + epsilon_2,
+                   eps1_over_eps = epsilon_1 / epsilon)
+
+# Replace cases where epsilon is NA with "Public"
+  plot_df$epsilon[is.na(plot_df$epsilon)] <- "Public" 
+  plot_df$eps1_over_eps[is.na(plot_df$eps1_over_eps)] <- "Public" 
+  
+  plot_df
+}
+```
+
+We now make use of the `pwr_plot` function to first figure out how much of the total privacy to allot to the different statistics, and then vary the total sample size to accurately compare to our Wilcoxon test.
+
+```{r allotment}
+# Allotment of Privacy Budget ---------------------------------------------
+
+# Make a list of sample sizes similar to those used in the Wilcoxon paper
+sizes <- seq(from = 1.3, to = 2.5, by = (.05))^10 %>% 
+            round_any(., 10)
+
+# Make a list of epsilon combinations that amount to the same total privacy
+# budget but differ in their allotment of it to each statistic
+epsilons <- list(c(.4, .6), c(.5, .5), c(.6, .4), c(.7, .3))
+
+# simulate the plot data
+t_eps_allotment <- pwr_plot(sizes = sizes[1:14],
+         epsilons = epsilons,
+         mean_null = 0,
+         sd_null = .3,
+         mean_alt = .3,
+         sd_alt = .3,
+         reps = 1e6,
+         alpha = .05)
+
+# save the plot data
+save(t_eps_allotment, file = "t/data/t_eps_allotment.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# plot the data
+t_eps_allotment_plot <- ggplot(t_eps_allotment) + 
+    geom_line(aes(x = unlist(sizes), 
+                  y = unlist(power), 
+                  col = as.factor(epsilon_1)),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", y = "Power") +
+    scale_color_discrete(name = TeX("$\\epsilon_{\\bar{x}}:\\epsilon_{tot}$")) +
+    scale_x_log10() +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+t_eps_allotment_plot
+
+ggsave(filename = "t_eps_allotment.png", 
+       plot = t_eps_allotment_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+
+```{r power}
+# Generalized Power Analysis; Power by Sample Size and Total Privacy Budget
+# ----------------------------------------------------------------------
+
+# simulate the plot data
+t_no_ties <- pwr_plot(sizes = sizes[1:24],
+         epsilons = list(c(.005, .005), c(.05, .05), c(.5, .5), c(NA, NA)),
+         mean_null = 0,
+         sd_null = .3,
+         mean_alt = .3,
+         sd_alt = .3,
+         reps = 2500,
+         alpha = .05)
+
+# save the plot data
+save(t_no_ties, file = "t/data/t_no_ties.Rda")
+
+# plot the data
+t_no_ties_plot <- ggplot(t_no_ties) + 
+    geom_line(aes(x = unlist(sizes), 
+                  y = unlist(power), 
+                  col = as.factor(unlist(epsilon))),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", y = "Power") +
+    scale_color_manual(name = TeX("$\\epsilon$"),
+                       values = colors) +
+    scale_x_log10() +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+t_no_ties_plot
+
+# save the plot
+ggsave(filename = "t_no_ties.png", 
+       plot = t_no_ties_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+
+We would also like to examine the uniformity of p-values of our test. We next write a `qq_plot` function that will help us get an idea of the error rates of our new test.
+
+```{r qq_plot}
+qq_plot <- function(alphas, sizes, epsilon, mean, sd, reps) {
+ 
+# Calculate Critical Values -----------------------------  
+
+# simulate null distributions at varying sample sizes. the piped object is 
+# a list of dataframes with length equal to length(sizes) then, calculate test 
+# statistics from the null distributions. the output, null_stats is a dataframe,
+# where each row represents reference distributions at a given n with nrow = reps
+
+  null_stats <-   map(.x = sizes,
+                      .f = gen_data, 
+                      epsilon = epsilon,
+                      mean = mean, 
+                      sd = sd, 
+                      reps = reps) %>%
+                  map_dfc(.x = ., 
+                          .f = calc_stat) %>%
+                  abs()
+   
+  
+# calculate critical values for each combination of epsilon and sample size
+# don't feed quantile a multidimensional alpha so that ordering of repeats is clear  
+  
+  crit_vals <- map2(.x = rep(null_stats, each = length(alphas)),
+                    .y = 1 - rep(alphas, times = length(null_stats)),
+                    .f = quantile) %>%
+                    unlist(use.names = FALSE)
+  
+# Find Power for Each of Sizes -----------------------------
+  
+# simulate alternate distributions at varying sample sizes. the piped 
+# object is a list of dataframes with length equal to length(sizes). then, 
+# calculate test statistics from the alternate distributions. the output, 
+# alt_stats is a dataframe where each column is the distribution of test 
+# statistics for a given sample size, with nrow = reps
+  
+  alt_stats <-    map(.x = sizes,
+                      .f = gen_data, 
+                      epsilon = epsilon,
+                      mean = mean, 
+                      sd = sd, 
+                      reps = reps) %>%
+                  map_dfc(.x = ., .f = calc_stat) %>%
+                  abs()
+  
+# create a vector of powers at given epsilon and sample size combinations 
+   
+  power_vector <- map2(.x = crit_vals, 
+                       .y = rep(alt_stats, each = length(alphas)), 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+
+# make a dataframe of arguments and resulting powers    
+  plot_df <- data.frame(sizes = rep(sizes, each = length(alphas)),
+                        alphas = alphas,
+                        power = power_vector)
+}
+
+# Make use of the qq_plot function to make a few plots
+t_qqplot <-  qq_plot(alphas = c(.001, seq(from = .01, to = .99, by = .005), .999), 
+                    sizes = c(10, 100, 1000),
+                    epsilon = c(.5, .5),
+                    mean = 0,
+                    sd = .3,
+                    reps = 1e6)
+
+# save the plot data
+save(t_qqplot, file = "t/data/t_qqplot.Rda")
+
+# generate the plot
+t_qqplot_plot <- ggplot(t_qqplot) +
+          geom_line(aes(x = power,
+                        y = alphas,
+                        col = as.factor(sizes)),
+                    size = 1.3) +
+          labs(x = "Theoretical Quantiles", y = "p-value Quantiles") +
+          scale_color_manual(name = "n",
+                             values = colors) + 
+          theme_minimal(base_family = "Times",
+                        base_size = 24) + 
+          theme(axis.line = element_line(colour = "black"))
+
+t_qqplot_plot
+
+# save the plot
+ggsave(filename = "t_qqplot.png", 
+       plot = t_qqplot_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+
+

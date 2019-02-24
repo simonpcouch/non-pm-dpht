@@ -1,0 +1,163 @@
+---
+output: github_document
+---
+# Mann-Whitney Power Analysis
+#### *Varying the Effect Size, Assuming No Ties*
+
+This file analyzes the power of our DP Mann-Whitney test with many different effect sizes.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+library(latex2exp)
+```
+
+Some of the functions used in this document are used, unedited, in several other documents throughout the power analysis. We load them now---documentation for each can be found in the relevant files in the `fxns` folder.
+
+```{r source}
+source('mw/fxns/mw.R')
+source('mw/fxns/gen_data.R')
+source('mw/fxns/calc_stat.R')
+source('mw/fxns/gen_n.R')
+```
+
+The `pwr_plot` function is a wrapper function for those previously defined. (Note that there are other `pwr_plot`s throughout this repo, which treat different inputs as variables.) The arguments are as follows:
+
+* `epsilons`: a list of any length of numeric vectors of length 2 (where c(NA, NA) indicates a public test)
+* `n`: a numeric vector of length 2
+* `mean_alt`: a list of arbitrary length of vectors of length 2, indicating the means to generate the alternate distributions with.
+* `reps`: a numeric indicating the number of repititions to carry simulations out with
+* `alpha`: a numeric indicating the significance level
+
+```{r pwr_plot}
+pwr_plot <- function(mean_alt, epsilons, n, reps, alpha) {
+
+# create privatized sample sizes for the simulation
+# of the reference distribution
+  new_n  <-   map(.x = epsilons, 
+                       .f = gen_n,
+                       n = n,
+                  delta = 1e-6)
+   
+# simulate null distributions of test statistics
+# for each epsilon
+  null_args_list <- list(n =        new_n,
+                         new_n =    new_n,
+                         epsilons = epsilons)
+  
+  null_stats <-   pmap(.l = null_args_list,
+                       .f = gen_data, 
+                       mean = c(0, 0), 
+                       sd = c(1, 1), 
+                       reps = reps) %>%
+                  map_dfc(.x = ., .f = calc_stat)
+
+# calculate critical values for each combination of epsilon and sample size
+  crit_vals  <-   map(null_stats, 
+                      quantile, 
+                      probs = alpha) %>% 
+                  unlist(use.names = FALSE)
+  
+# find alt stats  
+  calc_alt_stat <- function(mean_alt, epsilon, new_n, n, reps) {
+    gen_data(epsilon = epsilon, 
+             mean = mean_alt, 
+             sd = c(1, 1),
+             reps = reps,
+             n = n,
+             new_n = new_n) %>%
+    calc_stat(.)
+  }  
+  
+  alt_args_list <- list(mean_alt = rep(mean_alt, 
+                                       times = length(as.list(epsilons))),
+                        epsilon = rep(epsilons, 
+                                      each = length(mean_alt)),
+                        new_n = rep(new_n, 
+                                    each = length(mean_alt)))
+  
+  alt_stats <- pmap_dfc(.l = alt_args_list,
+                       .f = calc_alt_stat,
+                       n = n,
+                       reps = reps)
+  
+# this is a vector of powers at given epsilon and sample size combinations 
+  power_vector <- map2(.x = rep(crit_vals, each = length(mean_alt)), 
+                       .y = alt_stats, 
+                       .f = function(x, y) {mean(y < x)}) %>% 
+                       unlist(use.names = FALSE)
+  
+# create useful columns for plotting  
+  new_eps <- lapply(epsilons, sum) %>% 
+             unlist()
+  new_eps[is.na(new_eps)] <- "Public"
+  sigma_diff <- map(mean_alt, diff) %>% 
+                unlist(use.names = FALSE) %>% 
+                abs()
+
+# create a dataframe of arguments and powerss
+  data.frame(sigma_diff = rep(sigma_diff, times = length(epsilons)),
+             epsilon = rep(new_eps, each = length(sigma_diff)),
+             power = power_vector)
+
+}
+```
+
+```{r}
+# create a grey-scale friendly, qualitative color scheme
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+```
+
+We now make use of the `pwr_plot` function to generate the figure.
+
+```{r plot}
+# a list of common epsilons, where c(NA, NA) is the nonprivate version
+epsilons <- list(c(.039, .021), c(.065, .035), c(.65, .35), c(NA, NA))
+
+# a list of means of alternate distributions by increasing effect size
+mean_alt <- list(c(0, .01), c(0, .02), 
+                 c(0, .03), c(0, .04), c(0, .05), c(0, .075), 
+                 c(0, .82), c(0, .1), c(0, .13), c(0, .2), c(0, .3), c(0, .5), 
+                 c(0, .75), c(0, 1), c(0, 1.25), c(0, 1.5), c(0, 2), 
+                 c(0, 2.5), c(0, 3), c(0, 4), c(0, 6), c(0, 7.5), c(0, 10))
+
+# generate the plot data
+mw_vary_eff_size <- pwr_plot(mean_alt = mean_alt,
+                             epsilons = epsilons,
+                             n = c(750, 750),
+                             reps = 1e4,
+                             alpha = .05)
+
+# save the plot data
+save(mw_vary_eff_size, file = "mw/data/mw_vary_eff_size.Rda")
+
+# generate the plot
+mw_vary_eff_size_plot <- ggplot(mw_vary_eff_size) +
+             geom_line(aes(x = sigma_diff, 
+                           y = power, 
+                           col = as.factor(epsilon)),
+                       size = 1.3) +
+             labs(x = TeX("Effect Size ($\\mu_{1} - \\mu_{2}$)"), 
+                  y = "Power") +
+             theme_minimal(base_family = "Times", base_size = 24) +
+             scale_color_manual(name = TeX('$\\epsilon_{tot}$'), 
+                                values = colors) +
+             theme(axis.line = element_line(colour = "black")) +
+             scale_x_log10()
+
+mw_vary_eff_size_plot
+
+# save the plot
+ggsave(filename = "mw_vary_eff_size.png", 
+       plot = mw_vary_eff_size_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```

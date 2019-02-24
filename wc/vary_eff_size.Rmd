@@ -1,0 +1,199 @@
+---
+output: github_document
+---
+# Noncomparative Power Analysis
+#### *Varying Effect Size*
+
+This file analyzes the power of our DP Wilcoxon Signed-Rank test at varying effect sizes.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+library(latex2exp)
+```
+
+We define a set of functions to functionalize the power analysis process, eventually coming together in a `pwr_plot` function that simulates data, calculates test statistics, finds power, and plots an informative graph based on user arguments.
+
+Some functions used throughout this repo are universal to most of the files. We load them now. Refer to the relevant files in the `fxns` folder for documentation.
+
+```{r fxns}
+source('wc/fxns/wc_new.R')
+source('wc/fxns/calc_task_crit_val.R')
+source('wc/fxns/gen_null.R')
+```
+
+`gen_data` is a function that generates difference sets and noise with given parameters. Note that this `gen_data` is defined differently than the `gen_data` used throughout the rest of the repo. The arguments of `gen_data` are as follows:
+
+* `n`: a numeric of desired difference set size
+* `epsilon`: NA or a numeric--the epsilon to carry the test out with--NA indicates a public test
+* `mean`: a vector (length 2) of means to draw random samples with--supplying identical means and standard deviations generates a null distribution of difference sets
+* `sd`: a vector(length 2) of standard deviations to draw random samples with--supplying identical means and standard devations generates a null distribution of difference sets
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+
+The function outputs a dataframe of distributions of difference sets.
+
+```{r gen_data}
+gen_data <- function(n, epsilon = NA, mean, sd, reps) {
+  if (is.na(epsilon)) { # carry out the public version
+    data_frame(x1 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[1], n), reps),
+                       sd = rep(rep(sd[1], n), reps)),
+               x2 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[2], n), reps),
+                       sd = rep(rep(sd[2], n), reps)),
+               x = x1 - x2,
+               replicate = as.factor(rep(1:reps, each = n))) %>%
+      select(x, replicate)
+  } else { # carry out the private version
+    delta_f <- n*2
+    data_frame(x1 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[1], n), reps),
+                       sd = rep(rep(sd[1], n), reps)),
+               x2 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[2], n), reps),
+                       sd = rep(rep(sd[2], n), reps)),
+               x = x1 - x2,
+               replicate = as.factor(rep(1:reps, each = n)),
+               noise = rep(rlaplace(n = reps,
+                                    m = 0,
+                                    s = delta_f/epsilon), 
+                       each = n)) %>%
+    select(x, replicate, noise)
+  }
+}
+```
+
+`calc_stat` is a function that takes in a dataframe outputted by `gen_data` and outputs a vector of test statistics with length `reps`. The function simply detects whether the supplied dataframe was generated for a private or public test, and then groups the difference sets together and supplies them to `wc`.
+
+```{r calc_stat}
+calc_stat <- function(df) {
+    if ("noise" %in% colnames(df)) { # carry out the private version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc(x) + noise[1]) %>%
+    dplyr::select(stat) %>%
+    pull()
+  } else { # carry out the public version
+  df %>% 
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc(x)) %>%
+    dplyr::select(stat) %>%
+    pull()
+  }
+}
+```
+
+`pwr_plot` is a wrapper function for all of the functions defined above. The arguments are as follows:
+
+* `epsilons`: a list of numerics, where NA indicates the public test--note that the contents of this argument are treated as factors, so too many epsilons will results in a plot that is very difficult to interpret
+* `mean_alt`: a list of arbitrary length of vectors of length 2. The absolute difference between the contents of the vectors are the effect size (in difference in means of standard deviations, as the standard deviations of all tests are assumed to be c(1, 1))
+* `n`: a numeric indicating the sample size of the test
+* `reps`: a numeric indicating the number of simulations to carry the test out with
+
+```{r pwr_plot}
+pwr_plot <- function(epsilons, mean_alt, n, reps) {
+   
+# calculate a null distribution of test statistics, and take the absolute
+# value as to make this into a two-sided test
+  null_stats <-   map_dfc(.x = epsilons, 
+                           .f = gen_null, 
+                           reps = reps,
+                           n = n) %>%
+                  abs()
+
+# calculate critical values
+  crit_vals  <-   map(null_stats, 
+                      quantile, 
+                      probs = (1 -.05)) %>% 
+                  unlist(use.names = FALSE)
+
+# define a function to find test statistics for a given mean_alt and epsilon
+  calc_alt_stat <- function(mean_alt, epsilon, n, sd_alt, reps) {
+    gen_data(epsilon = epsilon, 
+             mean = mean_alt, 
+             sd = c(1, 1),
+             reps = reps,
+             n = n) %>%
+      calc_stat(.)
+  }
+
+# map the above function over all mean_alts and epsilons  
+  alt_stats <- map2_dfc(.x = rep(mean_alt, times = length(as.list(epsilons))),
+                        .y = rep(epsilons, each = length(mean_alt)),
+                       .f = calc_alt_stat,
+                       n = n,
+                       sd_alt = sd_alt,
+                       reps = reps) %>%
+    abs()
+  
+
+# calculate the power of each test
+  power_vector <- map2(.x = rep(crit_vals, each = length(mean_alt)), 
+                       .y = alt_stats, 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+
+# check if there are NA's in epsilons; if so, convert to "Public" for plotting
+  epsilons[is.na(epsilons)] <- "Public"
+  
+# find the difference in standard deviations of each trial  
+  sigma_diff <- map(mean_alt, diff) %>% unlist(use.names = FALSE) %>% abs()
+  
+# create a dataframe of arguments and resultant powers, plot it  
+  plot_df <- data.frame(sigma_diff = rep(sigma_diff, times = length(epsilons)),
+             epsilon = rep(epsilons, each = length(sigma_diff)),
+             power = power_vector)
+
+  plot_df
+}
+```
+
+We now make use of the `pwr_plot` function to make plots of our Wilcoxon test, where the effect size is varied.
+
+```{r plot}
+# create a greyscale-friendly, qualitative color scheme
+colors <- c("#05e200", "#000099", "#dd02e0", "#ece900")
+
+# generate plot data
+wc_vary_eff_size <- pwr_plot(epsilons = c(.01, .1, 1, NA),
+                    mean_alt = list(c(0, .01), c(0, .02), c(0, .03), c(0, .04), c(0, .05), c(0, .075), c(0, .82),
+                                    c(0, .1), c(0, .13), c(0, .2), c(0, .3), c(0, .5), c(0, .75), 
+                                    c(0, 1), c(0, 1.25), c(0, 1.5), c(0, 1.75), c(0, 2)),
+                    n = 2500, 
+                    reps = 1e6)
+
+# save the plot data
+save(wc_vary_eff_size, file = "wc/data/wc_vary_eff_size.Rda")
+
+# plot the data
+wc_vary_eff_size_plot <- ggplot(wc_vary_eff_size) +
+             geom_line(aes(x = sigma_diff, 
+                           y = power, 
+                           linetype = as.factor(epsilon), 
+                           col = as.factor(epsilon)),
+                       size = 1.3) +
+             labs(x = TeX("Effect Size ($\\mu_{v} - \\mu_{u}$)"), 
+                  y = "Power") +
+             theme_minimal(base_family = "Times", base_size = 24) +
+             scale_linetype_manual(values = c(4, 2, 3, 1),
+                                   name = TeX('$\\epsilon$')) +
+             scale_color_manual(name = TeX('$\\epsilon$'), 
+                                values = colors) +
+             lims(x = c(0, 2), y = c(0, 1)) +
+             theme(axis.line = element_line(colour = "black")) +
+             scale_x_log10()
+
+# save the plot
+ggsave(filename = "wc_vary_eff_size.png", 
+       plot = wc_vary_eff_size_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```

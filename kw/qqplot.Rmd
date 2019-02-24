@@ -1,0 +1,176 @@
+---
+output: github_document
+---
+# Kruskal-Wallis Power Analysis
+#### *Uniformity of p-values*
+
+This file analyzes the error rate of our DP Kruskal-Wallis test using quantile-quantile plots.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+library(latex2exp)
+```
+
+Some of the functions used in this document are used, unedited, in several other documents throughout the power analysis. We load them now---documentation for each can be found in the relevant files in the `fxns` folder.
+
+```{r}
+source('kw/fxns/kw.R')
+source('kw/fxns/kw_new.R')
+source('kw/fxns/calc_stat.R')
+source('kw/fxns/gen_data.R')
+```
+
+`qq_plot` is a wrapper function that vectorizes the functions defined above to make a dataframe for our qqplots.
+
+```{r qq_plot}
+qq_plot <- function(sizes, alphas, epsilon, kw_version, mean, sd, reps) {
+   
+# make a new sizes list to generate the null distribution that assumes
+# equal group sizes
+  null_sizes_1d <- lapply(sizes, mean) %>% lapply(., ceiling)
+  null_sizes    <- lapply(1:length(null_sizes_1d), 
+                          function(x) {rep(null_sizes_1d[[x]], 3)})
+  
+# simulate distributions of test statistics at each N 
+  null_stats <- map(.x = null_sizes,
+                    .f = gen_data,
+                    mean = mean,
+                    sd = sd,
+                    reps = reps,
+                    epsilon = 1,
+                    kw_version = kw_version) %>%
+                map_dfc(.x = ., .f = calc_stat)
+  
+# calculate critical values for each alpha and N  
+  crit_vals  <-   map(null_stats, quantile, probs = c(1 - alphas)) %>% 
+                  unlist(use.names = FALSE)
+  
+# compute "alternate" statistics (with the same parameters),
+# except the true sample sizes are used
+  alt_stats <- map(.x = sizes,
+                    .f = gen_data,
+                    mean = mean,
+                    sd = sd,
+                    reps = reps,
+                    epsilon = 1,
+                    kw_version = kw_version) %>%
+                map_dfc(.x = ., .f = calc_stat)
+  
+# compute a vector of type I error rates
+  type1 <- map2(.x = crit_vals, 
+                       .y = rep(alt_stats, 
+                                each = length(alphas)), 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+
+# make a list of the total sample size for each element of sizes 
+  N_list <- rep(lapply(sizes, sum), 
+                each = length(epsilon)) 
+  
+# find the proportion of the total sample size n that the maximum
+# group size takes up
+  prop_n <- unlist(lapply(sizes, max))/unlist(lapply(sizes, sum))
+  prop_n <- round(prop_n, digits = 2)     
+  
+# put together a dataframe of quantiles resulting from given parameters
+  data.frame(N = rep(unlist(N_list), each = length(alphas)),
+             alphas = rep(alphas, times = length(sizes)),
+             type1 = type1,
+             prop_n = rep(as.factor(prop_n), each = length(alphas)))
+}
+```
+
+We now make use of `qq_plot` to generate figures for the paper. The first assumes equal group sizes.
+
+```{r usage}
+# make a list of sample sizes
+sizes <- list(c(10, 10, 10), c(100, 100, 100), c(1000, 1000, 1000))
+
+# simulate the plot data
+kw_qqplot <- qq_plot(sizes = sizes,
+         alphas = seq(from = .01, to = .99, by = .01),
+         epsilon = 1,
+         kw_version = "abs",
+         mean = c(0, 0, 0),
+         sd = c(1, 1, 1),
+         reps = 1e6)
+
+# save the plot data
+save(kw_qqplot, file = "kw/data/kw_qqplot.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# plot the data
+kw_qqplot_plot <- ggplot(kw_qqplot) + 
+    geom_line(aes(x = type1, 
+                  y = alphas, 
+                  col = as.factor(N)),
+              size = 1.3) +
+    labs(x = "Theoretical Quantiles", y = "p-value Quantiles") +
+    scale_color_manual(name = "n",
+                       values = colors) +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+kw_qqplot_plot
+
+# save the plot
+ggsave(filename = "kw_qqplot_plot.png", 
+       plot = kw_qqplot_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+
+The next figure uses unequal group sizes.
+
+```{r usage}
+# make a vector of sample sizes with unequal group sizes
+# but identical total smaple sizes
+sizes_uneq <- list(c(80, 5, 5), c(60, 15, 15), c(30, 30, 30))
+
+# simulate the plot data
+kw_qqplot_uneq <- qq_plot(sizes = sizes_uneq,
+         alphas = seq(from = .01, to = .99, by = .01),
+         epsilon = 1,
+         kw_version = "abs",
+         mean = c(0, 0, 0),
+         sd = c(1, 1, 1),
+         reps = 1e6)
+
+# save the plot data
+save(kw_qqplot_uneq, file = "kw/data/kw_qqplot_uneq.Rda")
+
+# plot the data
+kw_qqplot_uneq_plot <- ggplot(kw_qqplot_uneq) + 
+    geom_line(aes(x = type1, 
+                  y = alphas, 
+                  col = as.factor(prop_n)),
+              size = 1.3) +
+    labs(x = "Theoretical Quantiles", y = "p-value Quantiles") +
+    scale_color_manual(name = "Proportion of \nn to max(n)",
+                       values = colors) +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+kw_qqplot_uneq_plot
+
+# save the plot
+ggsave(filename = "kw_qqplot_uneq.png", 
+       plot = kw_qqplot_uneq_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+

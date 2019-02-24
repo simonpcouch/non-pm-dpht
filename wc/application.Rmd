@@ -1,0 +1,292 @@
+---
+output: github_document
+---
+# Power Comparison on Real-World Data
+
+This document outlines the procedure of the comparative power analysis of Task 2016's algorithm, our new algorithm, and the public argorithm on the NYC taxi data.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+```
+
+#### The Data
+
+This is the tidied version of the data downloaded from `http://www.andresmh.com/nyctaxitrips/`. The procedure to replicate this dataset is in `tidy_taxi.Rmd`.
+
+```{r load_df}
+load("wc/data/tidy_taxi_data.Rda")
+
+str(tidy_taxi_data, give.attr = FALSE)
+```
+
+We want difference sets between day 1 and day 2, per driver, of: average number of passengers per trip, average time per trip (in seconds), and average distance per trip (in miles).
+
+```{r difference_sets}
+difference_sets <- tidy_taxi_data %>%
+  group_by(hack_license, day) %>%
+  summarize(num_passengers = mean(passenger_count),
+            trip_time = mean(trip_time_in_secs),
+            trip_dist = mean(trip_distance)) %>%
+  ungroup() %>%
+  group_by(hack_license) %>%
+  summarize(num_passengers = diff(num_passengers),
+            trip_time = diff(trip_time),
+            trip_dist = diff(trip_dist)) %>%
+  select(trip_time, trip_dist, num_passengers)
+
+str(difference_sets)
+```
+
+#### Loading Functions
+
+Some functions used throughout this repo are universal to most of the files. We load them now. Refer to the relevant files in the `fxns` folder for documentation.
+
+```{r fxns}
+source('wc/fxns/wc.R')
+source('wc/fxns/wc_new.R')
+source('wc/fxns/calc_task_crit_val.R')
+```
+
+#### Sample Difference Sets
+
+We now sample, with replacement, difference sets of size n from the original data, as well as noise for each trial to add to private tests.
+
+```{r gen_stats}
+sample_sets <- function(x, n, reps, k, epsilon) {
+  data_frame(x = sample(x = x, size = n*reps, replace = TRUE),
+             replicate = rep(1:reps, each = n),
+             noise = rep(rlaplace(n = reps,
+                                  m = 0,
+  # abuse indentation for 80 char limit                                                
+  s = 2*n/(sqrt(n*(n+1)*(2*n+1)/6)*(epsilon))),
+                         each = n),
+             noise_task_priv = rep(rlaplace(n = reps,
+                                            m = 0,
+  # abuse indentation for 80 char limit                                                
+  s = 4*k/(sqrt(2*k*(2*k+1)*(4*k+1)/6)*(epsilon))), 
+                                 each = n))
+}
+
+samples <- map(difference_sets, 
+               sample_sets, 
+               n = 400, 
+               reps = 1e5, 
+               k = 15, 
+               epsilon = 1)
+```
+
+#### Task 2016's Critical Values
+
+Task 2016 details a "High Privacy" procedure to ensure a known, minimum value of `n`. In the paper, they use a `k` of 15, resulting in an `NR-min = 2*k` of 30. They do not detail how to best select a `k`, so we use `k = 15` as well.
+
+```{r crit_val_task_high_privacy}
+crit_val_task_high_privacy <- calc_task_crit_val(n = 30, 
+                                                 alpha = .025, 
+                                                 epsilon = 1)
+```
+
+The "High Utility"" procedure is to assume the upper bound on ties is 70%, and use the critical value from `NR_min = .3n`.
+
+```{r crit_val_task_high_utility}
+crit_val_task_high_utility <- calc_task_crit_val(n = 400*.3, 
+                                                 alpha = .025, 
+                                                 epsilon = 1)
+```
+
+#### Public Critical Value
+
+We can find the public critical value with the CDF of the normal distribution.
+
+```{r}
+crit_val_public <- qnorm(p = 1 - .025)
+```
+
+#### Our Critical Value
+
+We will use simulation to calculate a critical value for our version of the test.
+
+The first step in simulation is to generate difference sets from the null distribution to feed to `wc`. The arguments for the function that does this, `gen_data`, are as follows:
+* `n`: a numeric of desired difference set size
+* `epsilon`: NA or a numeric--the epsilon to carry the test out with--NA indicates a public test
+* `mean`: a vector (length 2) of means to draw random samples with--supplying identical means and standard deviations is one way of generating a null distribution of test statistics
+* `sd`: a vector(length 2) of standard deviations to draw random samples with--supplying identical means and standard devations is one way of generating a null distribution of test statistics
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+* `k`: the priming value for which to sample the TC test's High Privacy noise from
+
+```{r gen_data}
+gen_data <- function(n, epsilon = NA, mean, sd, reps, k) {
+  if (is.na(epsilon)) { # carry out the public version
+    data_frame(x1 = rnorm(n = reps*n, 
+                          mean = rep(rep(mean[1], n), reps),
+                          sd = rep(rep(sd[1], n), reps)),
+               x2 = rnorm(n = reps*n, 
+                          mean = rep(rep(mean[2], n), reps),
+                          sd = rep(rep(sd[2], n), reps)),
+               x = x1 - x2,
+               replicate = as.factor(rep(1:reps, each = n))) %>%
+    select(x, replicate)
+  } else { # carry out the private version
+    delta_f <- n*2
+    data_frame(x1 = rnorm(n = reps*n, 
+                          mean = rep(rep(mean[1], n), reps),
+                          sd = rep(rep(sd[1], n), reps)),
+               x2 = rnorm(n = reps*n, 
+                          mean = rep(rep(mean[2], n), reps),
+                          sd = rep(rep(sd[2], n), reps)),
+               x = x1 - x2,
+               replicate = as.factor(rep(1:reps, each = n)),
+               noise_task_priv = rep(rlaplace(n = reps,
+                                              m = 0,
+  # abuse indentation for 80 char limit                                                
+  s = 4*k/(sqrt(2*k*(2*k+1)*(4*k+1)/6)*(epsilon))), 
+                                     each = n),
+               noise = rep(rlaplace(n = reps,
+                                    m = 0,
+  # abuse indentation for 80 char limit                                                
+  s = 2*n/(sqrt(n*(n+1)*(2*n+1)/6)*(epsilon))), 
+                                    each = n)) %>%
+    select(x, replicate, noise, noise_task_priv)
+  }
+}
+```
+
+`calc_stat` is a function that takes in a dataframe outputted by `gen_data` and outputs a vector of test statistics with length `reps`. The function groups the difference sets together and supplies them to `wc_new` or `wc`, depending on the `type` argument.
+
+```{r calc_stat}
+calc_stat <- function(df, type) {
+  
+  reps <- n_distinct(df$replicate)
+  n <- nrow(df)/reps
+  denom <- sqrt(n*(n + 1)*(2*n + 1)/6)
+  
+    if (type == "priv") { # carry out the high privacy version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(., stat = (((wc(x))/denom) + noise_task_priv[1])) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  } else if (type == "util") { # carry out the high utility version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(., stat = (((wc(x))/denom) + noise[1])) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  } else if (type == "public") { # carry out the public version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(., stat = ((wc(x))/denom)) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  } else if (type == "new") { # carry out the new version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(., stat = ((wc_new(x))/denom) + noise[1]) %>% 
+    dplyr::select(stat) %>%
+    pull()
+  }
+}
+```
+
+Now, we make use of `gen_data` and `calc_stat` to generate a null distribution of difference sets, calculate a null distribution of test statistics, and find the critical value at a two-sided significance level `alpha = .05`.
+
+```{r private_simulation}
+# generate a null distribution of difference sets
+crit_val_new <- gen_data(n = 400, 
+                         epsilon = 1, 
+                         mean = c(0, 0), 
+                         sd = c(1, 1), 
+                         reps = 1e7,
+                         k = 15) %>%
+  # feed these difference sets to calc_stat to generate a null 
+  # distribution of test statistics
+  calc_stat(., type = "new") %>%
+  # find the critical value at two-sided alpha = .05
+  quantile(., probs = (1 - .025), names = FALSE)
+```
+
+#### Finding Test Statistics
+
+Make use of the `calc_stat` function to find distributions of test statistics for each of the variables for each test type.
+
+```{r}
+test_types <- c("priv", "util", "new", "public")
+
+test_stats <- map2(rep(samples, times = length(test_types)),
+                   rep(test_types, each = length(samples)),
+                   calc_stat)
+```
+
+Now, we find the power of each test at two-sided `alpha = .05`, `n = 400`, for a given effect size. The input `x` to the `calc_power` function is a distribution of test statistics.
+
+```{r calc_power}
+calc_power <- function(x, crit_val) {
+  mean(abs(x) > crit_val)
+}
+
+power_vector <- map2(test_stats, 
+                     rep(c(crit_val_task_high_privacy,
+                           crit_val_task_high_utility,
+                           crit_val_new,
+                           crit_val_public), each = 3),
+                     calc_power) %>%
+                unlist()
+```
+
+#### Plotting
+
+Finally, we plot the data.
+
+```{r plot}
+# create a greyscale-friendly, qualitative color scheme
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# make a dataframe of powers
+wc_vs_task_application <- data_frame(power = power_vector,
+           test_type = c(rep(c("TC High \nPrivacy", 
+                               "TC High \nUtility",
+                               "New",
+                               "Public"), 
+                             each = 3)),
+           effect_size = c(rep(c("Trip Time (s)", 
+                                 "Trip Distance (mi)", 
+                                 "Number of \nPassengers"), 
+                               times = 4)))
+
+# save the plot data
+save(wc_vs_task_application, file = "wc/data/wc_vs_task_application.Rda")
+
+# plot the dataframe
+ggplot() +
+  geom_bar(data = wc_vs_task_application,
+           aes(x = ordered(effect_size, 
+                           levels = c("Trip Time (s)", 
+                                      "Trip Distance (mi)", 
+                                      "Number of \nPassengers")), 
+               y = power, 
+               fill = ordered(test_type, 
+                              levels = c("TC High \nPrivacy", 
+                                         "TC High \nUtility", 
+                                         "New", 
+                                         "Public"),
+                              labels = c("High Privacy", 
+                                         "High Utility", 
+                                         "New", 
+                                         "Public"))),
+           stat = "identity",
+           position = "dodge") +
+  labs(x = "Variable of Interest", 
+       y = "Power") +
+  theme_minimal(base_family = "Times",
+                base_size = 24) +
+  theme(axis.text.x = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        axis.line = element_line(colour = "black")) +
+  scale_fill_manual(name = "Test Type",
+                    values = colors)
+```

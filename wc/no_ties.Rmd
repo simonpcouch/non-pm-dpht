@@ -1,0 +1,194 @@
+---
+output: github_document
+---
+# Noncomparative Power Analysis
+#### *Multivariate Analysis Assuming No Ties*
+
+This file analyzes the power of our DP Wilcoxon Signed-Rank test varying sample size and epsilon, where sample data is assumed to come from a continuous distribution.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+library(latex2exp)
+```
+
+We define a set of functions to functionalize the power analysis process, eventually coming together in a `pwr_plot` function that simulates data, calculates test statistics, finds power, and plots an informative graph based on user arguments.
+
+Some functions used throughout this repo are universal to most of the files. We load them now. Refer to the relevant files in the `fxns` folder for documentation.
+
+```{r fxns}
+source('wc/fxns/wc_new.R')
+source('wc/fxns/gen_null.R')
+```
+
+`gen_data` is a function that generates difference sets and noise with given parameters. The arguments of `gen_data` are as follows:
+
+* `n`: a numeric of desired difference set size
+* `epsilon`: NA or a numeric--the epsilon to carry the test out with--NA indicates a public test
+* `mean`: a vector (length 2) of means to draw random samples with--supplying identical means and standard deviations generates a null distribution of difference sets
+* `sd`: a vector(length 2) of standard deviations to draw random samples with--supplying identical means and standard devations generates a null distribution of difference sets
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+
+The function outputs a dataframe of distributions of difference sets.
+
+```{r gen_data}
+gen_data <- function(n, epsilon = NA, mean, sd, reps) {
+  if (is.na(epsilon)) { # carry out the public version
+    data_frame(x1 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[1], n), reps),
+                       sd = rep(rep(sd[1], n), reps)),
+               x2 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[2], n), reps),
+                       sd = rep(rep(sd[2], n), reps)),
+               x = x1 - x2,
+               replicate = as.factor(rep(1:reps, each = n))) %>%
+      select(x, replicate)
+  } else { # carry out the private version
+    delta_f <- n*2
+    data_frame(x1 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[1], n), reps),
+                       sd = rep(rep(sd[1], n), reps)),
+               x2 = rnorm(n = reps*n, 
+                       mean = rep(rep(mean[2], n), reps),
+                       sd = rep(rep(sd[2], n), reps)),
+               x = x1 - x2,
+               replicate = as.factor(rep(1:reps, each = n)),
+               noise = rep(rlaplace(n = reps,
+                                    m = 0,
+                                    s = delta_f/epsilon), 
+                       each = n)) %>%
+    select(x, replicate, noise)
+  }
+}
+```
+
+`calc_stat` is a function that takes in a dataframe outputted by `gen_data` and outputs a vector of test statistics with length `reps`. The function simply detects whether the supplied dataframe was generated for a private or public test, and then groups the difference sets together and supplies them to `wc`.
+
+```{r calc_stat}
+calc_stat <- function(df) {
+    if ("noise" %in% colnames(df)) { # carry out the private version
+  df %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc(x) + noise[1]) %>%
+    dplyr::select(stat) %>%
+    pull()
+  } else { # carry out the public version
+  df %>% 
+    dplyr::group_by(replicate) %>%
+    dplyr::summarize(stat = wc(x)) %>%
+    dplyr::select(stat) %>%
+    pull()
+  }
+}
+```
+
+`pwr_plot` is a wrapper function for each of the functions defined above. The arguments of the function are as follows:
+* `sizes`: a list of numerics
+* `epsilons`: a list of numerics (can include NA)
+* arguments beginning with `mean` or `sd` are vectors of length 2--the first two (in position) are the arguments to generate the null distribution, and the second two are to generate the alternate distribution
+* `reps`: a numeric indicating the number of times to repeat the simulation--as reps increases, precision increases
+
+```{r pwr_plot}
+pwr_plot <- function(sizes, epsilons, mean_null, sd_null, mean_alt, sd_alt, reps) {
+   
+# generate a distribution of null test statistics at each sample size and
+# epsilon combination
+  
+  null_stats <-   map2_dfc(.x = rep(sizes, each = length(epsilons)), 
+                           .y = rep(epsilons, times = length(sizes)), 
+                           .f = gen_null, 
+                           reps = reps) %>%
+                  abs()
+
+# calculate critical values for each combination of epsilon and sample size
+  
+  crit_vals  <-   map(null_stats, 
+                      quantile, 
+                      probs = (1 -.05)) %>% 
+                  unlist(use.names = FALSE)
+  
+# simulate alternate distributions of difference sets at varying sample 
+# size and epsilon combinations, and then calculate test statistics 
+# from the distributions. the output, alt_stats, is a dataframe, where each 
+# row is a distinct combination of epsilons & sample size, with nrow = reps
+  
+  alt_stats <-    map2(.x = rep(sizes, each = length(epsilons)), 
+                       .y = rep(epsilons, times = length(sizes)), 
+                       .f = gen_data, 
+                       mean = mean_alt, sd = sd_alt, reps = reps) %>%
+                  map_dfc(.x = ., .f = calc_stat) %>%
+                  abs()
+  
+# this is a vector of powers at given epsilon and sample size combinations 
+   
+  power_vector <- map2(.x = crit_vals, 
+                       .y = alt_stats, 
+                       .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+
+# check if there are NA's in epsilons; if so, convert to "Public" for plotting
+  epsilons[is.na(epsilons)] <- "Public"
+    
+# create a dataframe of arguments and resultant powers, plot it  
+  plot_df <- data_frame(epsilon = unlist(rep(epsilons, length(sizes))),
+             sizes = unlist(rep(sizes, each = length(epsilons))),
+             power = power_vector)
+
+  plot_df
+}
+```
+
+The following function calls generate the plot to be used in the paper.
+
+```{r plot}
+# these sample sizes are chosen so as to create equal intervals between 
+# points in the x-axis when plotting log-10 sample size
+sizes <- seq(from = 1.45, to = 2.45, by = (.05))^10 %>% round_any(., 30) %>% c(10, .) %>% as.list()
+epsilons <- list(.01, .1, 1, NA)
+
+# create a greyscale-friendly, qualitative color scheme
+colors <- c("#05e200", "#000099", "#dd02e0", "#ece900")
+
+# generate plot data
+wc_no_ties <- pwr_plot(sizes = sizes, 
+         epsilons = epsilons,
+         mean_null = c(0, 0), 
+         sd_null = c(1, 1), 
+         mean_alt = c(0, 1), 
+         sd_alt = c(1, 1), 
+         reps = 1e6)
+
+# save the plot data
+save(wc_no_ties, file = "wc/data/wc_no_ties.Rda")
+
+# plot the data
+wc_no_ties_plot <- ggplot(wc_no_ties) +
+             geom_line(aes(x = sizes, 
+                           y = power, 
+                           linetype = as.factor(epsilon), 
+                           col = as.factor(epsilon)),
+                       size = 1.3) +
+             labs(x = expression("Database Size"~italic("n")), 
+                  y = "Power") +
+             scale_x_log10() + 
+             theme_minimal(base_family = "Times", base_size = 24) +
+             scale_linetype_manual(values = c(4, 2, 3, 1),
+                                   name = TeX("$\\epsilon$")) +
+             scale_color_manual(name = TeX("$\\epsilon$"), 
+                                values = colors) +
+             theme(axis.line = element_line(colour = "black"))
+
+# save the plot
+ggsave(filename = "wc_no_ties.png", 
+       plot = wc_no_ties_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```

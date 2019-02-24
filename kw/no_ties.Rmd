@@ -1,0 +1,460 @@
+---
+output: github_document
+---
+# Kruskal-Wallis Power Analysis
+#### *Assuming No Ties—Varying Sample Size and Epsilon*
+
+This file analyzes the power of our DP Kruskal-Wallis test at several sample sizes and epsilons when sample data is assumed to be continuous.
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(rmutil)
+library(latex2exp)
+```
+
+Some of the functions used in this document are used, unedited, in several other documents throughout the power analysis. We load them now---documentation for each can be found in the relevant files in the `fxns` folder.
+
+```{r source}
+source('kw/fxns/kw.R')
+source('kw/fxns/kw_new.R')
+source('kw/fxns/calc_stat.R')
+source('kw/fxns/gen_data.R')
+```
+
+`pwr_plot` is a wrapper function that vectorizes the functions defined above over several combinations of sample sizes and epsilons. Note that there are other `pwr_plot`s defined throughout this repo, which all treat different inputs as variables.
+
+* `sizes`: A list of numeric vectors of length x, indicating the sample sizes to carry out the test with. Each element of the list must be the same length.
+* `epsilons`: A list of numerics (where NA indicates a public test)
+* `kw_version`: A character vector: either "sq" (referring to the regular H statistic), "abs" (referring to the unsquared absolute value H statistic), or both, so that noise with the appropriate sensitivity can be generated.
+* arguments beginning with `mean` and `sd` are vectors of length x, indicating the parameters to generate data for the alternate and null distribution for.
+* `reps`: A numeric indicating the number of repititions to carry out the simulations with.
+* `alpha`: A numeric indicating the significance level to carry the test out with.
+
+```{r pwr_plot}
+pwr_plot <- function(sizes, epsilons, kw_version, mean_null, sd_null, mean_alt, sd_alt, reps, alpha) {
+   
+ # we first create a list of lists, (can be thought of as a dataframe where
+ # each row is a unique combination of sizes, epsilons, and kw_version). we
+ # do this step instead of using cross() for clarity
+  arg_list <- list(n =          rep(sizes,
+                                    each = length(epsilons)*length(kw_version)), 
+                   epsilon =    rep(epsilons,
+                                    times = length(sizes)*length(kw_version)),
+                   kw_version = rep(kw_version,
+                                    times = length(sizes),
+                                    each = length(epsilons)))
+  
+# we need to do the same for the simulation of the reference distribution,
+# where we assume equal group sizes
+  null_sizes_1d <- lapply(sizes, mean) %>% lapply(., ceiling)
+  null_sizes    <- lapply(1:length(null_sizes_1d), 
+                          function(x) {rep(null_sizes_1d[[x]], length(sizes[[1]]))})
+
+  arg_list_null <- list(n =     rep(null_sizes,
+                                    each = length(epsilons)*length(kw_version)), 
+                   epsilon =    rep(epsilons,
+                                    times = length(sizes)*length(kw_version)),
+                   kw_version = rep(kw_version,
+                                    times = length(sizes),
+                                    each = length(epsilons)))
+    
+    
+# simulate null distributions with varying parameters and then calculate test 
+# statistics from the null distributions. the output, null_stats is a 
+# dataframe, where each row is a distinct combination of epsilon, sample 
+# size, and kw_version
+  
+  null_stats <- pmap(.l = arg_list_null,
+                 .f = gen_data,
+                 mean = mean_null,
+                 sd = sd_null, 
+                 reps = reps) %>%
+                map_dfc(.x = ., .f = calc_stat)
+
+# calculate critical values for each combination of epsilon, sample 
+# size, and kw_version
+  
+  crit_vals  <-   map(null_stats, quantile, probs = 1 - alpha) %>% 
+                  unlist(use.names = FALSE)
+  
+# simulate alternate distributions with varying parameters and then calculate test 
+# statistics from the sample distributions. the output, alt_stats, is a 
+# dataframe, where each row is a distribution of *test statistics* for each
+# distinct combination of epsilon, sample size, and kw_version
+  
+  alt_stats <- pmap(.l = arg_list,
+                    .f = gen_data,
+                    mean = mean_alt,
+                    sd = sd_alt, 
+                    reps = reps) %>%
+               map_dfc(.x = ., .f = calc_stat)
+  
+# this is a vector of powers at several parameterizations
+   
+  power_vector <- map2(.x = crit_vals, .y = alt_stats, .f = function(x, y) {mean(y > x)}) %>% 
+                       unlist(use.names = FALSE)
+
+  
+# make a list of the total sample size for each element of sizes 
+  N_list <- rep(lapply(sizes, sum), 
+                each = length(epsilons)*length(kw_version)) 
+  n1_list <- rep(lapply(sizes, '[[', 1), 
+                 each = length(epsilons)*length(kw_version)) 
+  
+# put together a dataframe of powers resulting from given parameters
+  plot_df <- cbind(N = unlist(N_list),
+                   n1 = unlist(n1_list),
+                   bind_rows(arg_list),
+                   power_vector) %>%
+             as_data_frame()
+  
+# check if there are NA's in epsilon; if so, convert to "Public" for plotting
+  plot_df$epsilon[is.na(plot_df$epsilon)] <- "Public"
+
+  plot_df
+}
+```
+
+We now make use of the `pwr_plot` function to put together a dataframe, plot it, and save it.
+
+```{r usage}
+# make a vector of sample sizes
+sizes_1d <- seq(from = 1.1, to = 2.3, by = .05)^10 %>% round() %>% as.list()
+sizes <- lapply(1:length(sizes_1d), function(x) {rep(sizes_1d[[x]], 3)})
+
+# simulate the plot data
+kw_no_ties <- pwr_plot(sizes = sizes,
+         epsilons = list(.1, 1, NA),
+         kw_version = c("sq", "abs"),
+         mean_null = c(0, 0, 0),
+         sd_null = c(1, 1, 1),
+         mean_alt = c(-1, 0, 1),
+         sd_alt = c(1, 1, 1),
+         reps = 1e4,
+         alpha = .05)
+
+# save the plot data
+save(kw_no_ties, file = "kw/data/kw_no_ties.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# plot the data
+kw_no_ties_plot <- ggplot(kw_no_ties) + 
+    geom_line(aes(x = unlist(N), 
+                  y = unlist(power_vector), 
+                  col = as.factor(unlist(epsilon)),
+                  linetype = factor(kw_version)),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", y = "Power") +
+    scale_color_manual(name = TeX("$\\epsilon$"),
+                       values = colors[c(1, 3, 4)]) +
+    scale_linetype_discrete(name = "Test Type", labels = c(unname(TeX("KW_{abs}")),
+                                                      unname(TeX("KW")))) +
+    scale_x_log10() +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+kw_no_ties_plot
+
+# save the plot
+ggsave(filename = "kw_no_ties.png", 
+       plot = kw_no_ties_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+
+We now make use of the above code to compare the 2-group Kruskal-Wallis to our differentially-private Mann-Whitney test.
+
+```{r usage}
+# make a new vector of sample sizes with only 2 groups with
+# the same sample sizes as the Mann-Whitney test
+sizes_2_1d <- seq(from = 1.2, to = 2.53, by = (.07))^10 %>% round() %>% as.list()
+sizes_2 <- lapply(1:length(sizes_2_1d), function(x) {rep(sizes_2_1d[[x]], 2)})
+
+# simulate the plot data
+kw_two_group <- pwr_plot(sizes = sizes_2,
+         epsilons = list(.01, .1, 1, NA),
+         kw_version = c("sq", "abs"),
+         mean_null = c(0, 0),
+         sd_null = c(1, 1),
+         mean_alt = c(0, 1),
+         sd_alt = c(1, 1),
+         reps = 1e4,
+         alpha = .05)
+
+# save the plot data
+save(kw_two_group, file = "kw/data/kw_two_group.Rda")
+
+# create a greyscale-friendly, qualitative color palette
+colors <- c("#000099", "#05e200", "#dd02e0", "#ece900")
+
+# bind the data with that from the Mann-Whitney
+load("mw/data/mw_no_ties.Rda")
+
+mw_no_ties$epsilon[mw_no_ties$epsilon == 0] <- "Public"
+
+MW_prepped <- mw_no_ties %>%
+  select(epsilon = epsilon,
+         N = sizes,
+         power = power) %>%
+  mutate(kw_version = NA,
+         test = "MW")
+
+KW_prepped <- kw_two_group %>%
+  select(epsilon = epsilon,
+         N = N,
+         power = power_vector,
+         kw_version = kw_version) %>%
+  mutate(test = "KW")
+
+# plot_comp_data contains comparative data for
+# the power of MW and KW tests
+kw_vs_mw <- rbind(MW_prepped, KW_prepped)
+
+# save the plot data
+save(kw_vs_mw, file = "kw/data/kw_vs_mw.Rda")
+
+######## plot the data
+kw_vs_mw_plot <- kw_vs_mw %>%
+    filter(kw_version == "abs" | is.na(kw_version)) %>%
+    ggplot() + 
+    geom_line(aes(x = unlist(N), 
+                  y = unlist(power), 
+                  col = as.factor(unlist(epsilon)),
+                  linetype = factor(test)),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", y = "Power") +
+    scale_color_manual(name = TeX("$\\epsilon$"),
+                       values = colors) +
+    scale_linetype_manual(name = "Test",
+                          values = c("solid", "dotted"),
+                          labels = c(unname(TeX("\\widetilde{KW}abs")),
+                                     unname(TeX("\\widetilde{MW}")))) +
+    scale_x_log10() +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+kw_vs_mw_plot
+
+# save the plot
+ggsave(filename = "kw_vs_mw.png", 
+       plot = kw_vs_mw_plot,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+
+We also compare our test to the Mann-Whitney in the setting where the group sample sizes are publicly known, so that all of epsilon can be alloted to estimating the statistic.
+
+```{r}
+# load the raw mann-whitney data
+load("mw/data/mw_public_n.Rda")
+
+# Switch out epsilon == 0 to "Public"
+mw_public_n$epsilon[mw_public_n$epsilon == 0] <- "Public"
+  
+# make a new column specifying the test type
+mw_tidy <- mw_public_n %>%
+  mutate(test = "Mann-Whitney")
+
+# load the raw kruskal-wallis data
+kw_tidy <- kw_two_group %>%
+  filter(kw_version == "abs") %>%
+  filter(epsilon != .01) %>%
+  select(sizes = N, epsilon, power = power_vector) %>%
+  mutate(test = "Kruskal-Wallis")
+
+comp_kw_mw_public_n <- rbind(mw_tidy, kw_tidy)
+
+# reorder the color palette so that yellow is always public
+colors <- c("#000099", "#dd02e0", "#ece900", "#05e200")
+
+plot_comp_public_n <- comp_kw_mw_public_n %>%
+    ggplot() + 
+    geom_line(aes(x = sizes, 
+                  y = unlist(power), 
+                  col = as.factor(unlist(epsilon)),
+                  linetype = factor(test)),
+              size = 1.3) +
+    labs(x = "Total Sample Size n", y = "Power") +
+    scale_color_manual(name = TeX("$\\epsilon$"),
+                       values = colors) +
+    scale_linetype_discrete(name = "Test Type",
+                            labels = c("KW", "MW")) +
+    scale_x_log10(limits = c(10, 2000)) +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+plot_comp_public_n
+
+# save the plot
+ggsave(filename = "kw_vs_mw_public_n.png", 
+       plot = plot_comp_public_n,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+```
+
+We would like to compare to the Mann-Whitney when group sizes are unequal, too. We load the data from the Mann-Whitney folder and run the Kruskal-Wallis on the same sample sizes.
+
+```{r mw uneq}
+# Make a sequence from 5 to 125 by 5
+sizes_mw_uneq_1d <- c(1, seq(5, 125, 5)) %>% as.list()
+# Make the sum of every vector in the list 250
+sizes_mw_uneq <- lapply(sizes_mw_uneq_1d, function(x) {return(c(x, 250-x))})
+# Extend that list so it also has entries that add to 1000
+sizes_mw_uneq <- rbind(sizes_mw_uneq, lapply(sizes_mw_uneq, function(x) {4*x}))
+
+# simulate the plot data
+kw_2gp_uneq <- pwr_plot(sizes = sizes_mw_uneq,
+         epsilons = list(.1, 1, NA),
+         kw_version = c("sq", "abs"),
+         mean_null = c(0, 0),
+         sd_null = c(1, 1),
+         mean_alt = c(0, 1),
+         sd_alt = c(1, 1),
+         reps = 1e4,
+         alpha = .05)
+
+# save the plot data
+save(kw_2gp_uneq, file = "kw/data/kw_2gp_uneq.Rda")
+```
+
+We now bind this data with that run on the sample parameterizations from the Mann-Whitney folder.
+
+```{r}
+kw_2gp_uneq_data_tidy <- kw_2gp_uneq %>%
+  mutate(test = case_when(epsilon == "Public" & kw_version == "sq" ~ "Public H",
+                          epsilon != "Public"  & kw_version == "abs" ~ "Private KW_abs")) %>%
+  filter(test == "Public H" | test == "Private KW_abs") %>%
+  select(-test) %>%
+  mutate(test = "Kruskal-Wallis") %>%
+  select(N, n1, epsilon, power = power_vector, test)
+
+# load the mann-whitney data
+load("mw/data/mw_no_ties_uneq.Rda")
+
+mw_uneq_data_tidy <- mw_no_ties_uneq %>%
+  mutate(test = "Mann-Whitney") %>%
+  select(N = n, n1, epsilon, power, test)
+
+kw_vs_mw_uneq_data <- rbind(kw_2gp_uneq_data_tidy, mw_uneq_data_tidy)
+
+# save the plot data
+save(kw_vs_mw_uneq_data, file = "kw/data/kw_vs_mw_uneq.Rda")
+
+# plot the data
+kw_vs_mw_uneq_n250 <- kw_vs_mw_uneq_data %>%
+  filter(N == 250) %>%
+    ggplot() + 
+    geom_line(aes(x = n1, 
+                  y = power, 
+                  col = as.factor(unlist(epsilon)),
+                  linetype = factor(test)),
+              size = 1.3) +
+    labs(x = "Group Size m", y = "Power") +
+    scale_color_manual(name = TeX("$\\epsilon$"),
+                       values = colors[c(4, 2, 3)]) +
+    scale_linetype_discrete(name = "Test \nType",
+                            labels = c("KW", "MW")) +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+
+kw_vs_mw_uneq_n250
+
+# save the plot
+ggsave(filename = "kw_vs_mw_uneq_n250.png", 
+       plot = kw_vs_mw_uneq_n250,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+
+# DO the same procedure for n = 1000
+# plot the data
+kw_vs_mw_uneq_n1000 <- kw_vs_mw_uneq_data %>%
+  filter(N == 1000) %>%
+    ggplot() + 
+    geom_line(aes(x = n1, 
+                  y = power, 
+                  col = as.factor(unlist(epsilon)),
+                  linetype = factor(test)),
+              size = 1.3) +
+    labs(x = "Group Size m", y = "Power") +
+    scale_color_manual(name = TeX("$\\epsilon$"),
+                       values = colors[c(4, 2, 3)]) +
+    scale_linetype_discrete(name = "Test \nType",
+                            labels = c("KW", "MW")) +
+    theme_minimal(base_family = "Times",
+                  base_size = 24)  + 
+    theme(axis.line = element_line(colour = "black"))
+    
+kw_vs_mw_uneq_n1000
+
+# save the plot
+ggsave(filename = "kw_vs_mw_uneq_n1000.png", 
+       plot = kw_vs_mw_uneq_n1000,
+       path = "figures",
+       width = 10,
+       height = 6,
+       units = "in")
+
+```
+
+We also want to generate data to compare to Swanberg's ANOVA test at some different parameterizations. First, a large-ish epsilon (1) and a small effect size (1/3rd of a sd max between groups)
+
+```{r}
+# make a vector of sample sizes
+sizes_1d <- seq(from = 1.25, to = 2.3, by = .04)^10 %>% (function(x) {x/3}) %>% round() %>% as.list()
+sizes <- lapply(1:length(sizes_1d), function(x) {rep(sizes_1d[[x]], 3)})
+
+# simulate the plot data
+kw_small_effect <- pwr_plot(sizes = sizes,
+         epsilons = list(1, NA),
+         kw_version = c("sq", "abs"),
+         mean_null = c(0, 0, 0),
+         sd_null = c(2, 2, 2),
+         mean_alt = c(-1/3, 0, 1/3),
+         sd_alt = c(2, 2, 2),
+         reps = 1e4,
+         alpha = .05)
+
+# save the plot data
+save(kw_small_effect, file = "kw/data/kw_small_effect.Rda")
+```
+
+We also generate data with a small epsilon (.1) and a huge effect (10 standard deviations) to show the case when ANOVA might beat the Kruskal-Wallis.
+
+```{r}
+# make a vector of sample sizes
+sizes_1d <- seq(from = 1.25, to = 2.3, by = .04)^10 %>% (function(x) {x/3}) %>% round() %>% as.list()
+sizes <- lapply(1:length(sizes_1d), function(x) {rep(sizes_1d[[x]], 3)})
+
+# simulate the plot data
+kw_big_effect <- pwr_plot(sizes = sizes,
+         epsilons = list(.1, NA),
+         kw_version = c("sq", "abs"),
+         mean_null = c(0, 0, 0),
+         sd_null = c(.1, .1, .1),
+         mean_alt = c(-.5, 0, .5),
+         sd_alt = c(.1, .1, .1),
+         reps = 1e4,
+         alpha = .05)
+
+# save the plot data
+save(kw_big_effect, file = "kw/data/kw_big_effect.Rda")
+```

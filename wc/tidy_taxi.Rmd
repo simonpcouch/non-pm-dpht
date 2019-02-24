@@ -1,0 +1,61 @@
+---
+output: github_document
+---
+# NYC Taxi Data Tidying
+
+This file serves to demonstrate the procedure for tidying and filtering the sample dataset used in our own and Task 2016's paper. The result, `tidy_taxi_data.Rda`, is a tidy dataset containing relevant variables on all taxi trips on January 1st and 2nd in 2013 in New York City.
+
+#### Setup
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+```
+
+The original data file is available at \link{http://www.andresmh.com/nyctaxitrips/}. The relevant file is `trip_data_1.csv`.
+
+```{r import}
+# this line will need to be changed in respect to where the trip_data_1.csv file is stored
+raw_trip_data <- read_csv("trip_data_1.csv")
+
+str(raw_trip_data, give.attr = FALSE)
+```
+
+Isolate rides that both occurred in the first two days of January and were given by drivers who gave rides on both the 1st and the 2nd.
+
+```{r filter}
+tidy_taxi_data <- raw_trip_data %>%
+  filter(day(pickup_datetime) <= 2 & day(dropoff_datetime) <= 2) %>%
+  mutate(dom = day(pickup_datetime)) %>%
+  filter(dom <= 2) %>%
+  group_by(hack_license) %>%
+  mutate(ndays = n_distinct(dom)) %>%
+  filter(ndays == 2)
+  
+n_distinct(tidy_taxi_data$hack_license)
+```
+
+Task 2016 claims there are 17,069 distinct drivers in the dataset meeting these criteria--we found there to be 17,066.
+
+The variables of interest are `hack_license`, `day`, `passenger_count`, `trip_time_in_secs`, and `trip_distance`. We select only those variables.
+
+```{r select}
+tidy_taxi_data <- tidy_taxi_data %>%
+  select(hack_license, 
+         day = dom, 
+         passenger_count, 
+         trip_time_in_secs, 
+         trip_distance)
+```
+
+Finally, we save the file to be used in power analysis.
+
+```{r save}
+save(tidy_taxi_data, 
+     file = "wc/data/tidy_taxi_data.Rda")
+```
+
