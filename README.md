@@ -4,7 +4,8 @@
 This repository contains source code to carry out the power analyses of
 several differentially private hypothesis testing algorithms from the
 2019 paper *Differentially Private Nonparametric Hypothesis Testing*
-\[1\].
+\[1\], published in the Proceedings of the 26th ACM Conference on
+Computer and Communications Security.
 
 The following conventions have been maintained throughout the repository
 in order to help the reader follow along.
@@ -76,8 +77,9 @@ will result in less precise plotting points), the `reps` argument can be
 decreased.
 
 \[1\] Simon Couch, Zeki Kazan, Kaiyan Shi, Andrew Bray, and Adam Groce.
-“Differentially Private Nonparametric Hypothesis Testing.” arXiv.
-2019.
+“Differentially Private Nonparametric Hypothesis Testing.” In
+*Proceedings of the 26th ACM Conference on Computer and Communications
+Security*. 2019.
 
 \[2\] Marika Swanberg, Ira Globus-Harris, Iris Griffith, Anna Ritz, Adam
 Groce, and Andrew Bray. “Improved Differentially Private Analysis of
